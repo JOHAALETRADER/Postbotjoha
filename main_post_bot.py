@@ -22,11 +22,11 @@ from telegram.ext import (
 
 TOKEN = os.environ.get("POST_BOT_TOKEN")
 CHANNEL_USERNAME = "@JohaaleTrader_es"
-ADMIN_ID = 5958164558
+ADMIN_ID = 5958164558   # tu ID real
 
 user_states = {}
 drafts = {}
-last_post_message_id = None  # para edición REAL de publicaciones
+last_post_message_id = None
 
 
 # ======================================================
@@ -64,7 +64,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================================================
-#           MANEJO DEL BOTÓN EDITAR (MENÚ 3 OPCIONES)
+#                 MENÚ DE EDICIÓN 3 OPCIONES
 # ======================================================
 
 async def show_edit_menu(update, context):
@@ -79,12 +79,11 @@ async def show_edit_menu(update, context):
         "¿Qué deseas editar?",
         reply_markup=keyboard
     )
-
     user_states[update.effective_user.id] = "EDIT_MENU"
 
 
 # ======================================================
-#                MANEJO DE MENSAJES PRINCIPALES
+#              MANEJO DE MENSAJES
 # ======================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -117,11 +116,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         drafts[user_id] = {}
         user_states[user_id] = "WAITING_CONTENT"
 
-        await message.reply_text("Envíame el contenido (texto, imagen, video o audio).")
+        await message.reply_text("Envíame el contenido (texto, media).")
         return
 
     # -------------------------------
-    # EDITAR PUBLICACIÓN (MENU)
+    # EDITAR PUBLICACIÓN (MENÚ)
     # -------------------------------
     if text == "✏️ Editar publicación":
         await show_edit_menu(update, context)
@@ -134,11 +133,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         drafts[user_id] = {}
         user_states[user_id] = "WAITING_CONTENT_SCHEDULE"
 
-        await message.reply_text("Envíame el contenido que quieres programar.")
+        await message.reply_text("Envíame el contenido que deseas programar.")
         return
 
     # ======================================================
-    #     RECEPCIÓN DE CONTENIDO NUEVO (CREAR / PROGRAMAR)
+    #    RECIBIENDO CONTENIDO PRINCIPAL
     # ======================================================
 
     if state in ["WAITING_CONTENT", "WAITING_CONTENT_SCHEDULE", "EDITING_DRAFT"]:
@@ -168,20 +167,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         drafts[user_id] = content
+        user_states[user_id] = "WAITING_BUTTONS"
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Publicar ahora", callback_data="publish_now")],
-            [InlineKeyboardButton("⏳ Programar", callback_data="schedule")],
-            [InlineKeyboardButton("❌ Cancelar", callback_data="cancel")],
-        ])
+        await message.reply_text("Agrega los enlaces (uno por línea).")
+        return
 
-        await message.reply_text("Preview listo.\nElige una opción:", reply_markup=keyboard)
+    # ======================================================
+    #     RECIBIENDO BOTONES
+    # ======================================================
+
+    if state == "WAITING_BUTTONS":
+        lines = text.splitlines()
+        buttons = []
+
+        for line in lines:
+            if "-" not in line:
+                continue
+
+            label, url = line.split("-", 1)
+            label = label.strip()
+            url = url.strip()
+
+            if label and url:
+                buttons.append([InlineKeyboardButton(label, url=url)])
+
+        drafts[user_id]["buttons"] = InlineKeyboardMarkup(buttons)
+
+        preview_markup = InlineKeyboardMarkup(buttons)
+
+        await message.reply_text(
+            "Preview listo.\nElige una opción:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 Publicar ahora", callback_data="publish_now")],
+                [InlineKeyboardButton("⏳ Programar", callback_data="schedule")],
+                [InlineKeyboardButton("❌ Cancelar", callback_data="cancel")],
+            ])
+        )
+
         user_states[user_id] = "CONFIRM"
         return
 
-    # -------------------------------
-    # FECHA PARA PROGRAMAR
-    # -------------------------------
+    # ======================================================
+    #       FECHA PARA PROGRAMAR
+    # ======================================================
+
     if state == "WAITING_DATETIME":
         try:
             dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
@@ -193,13 +222,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         async def send_later(context):
             if draft["type"] == "text":
-                await context.bot.send_message(CHANNEL_USERNAME, draft["text"])
+                await context.bot.send_message(
+                    CHANNEL_USERNAME,
+                    draft["text"],
+                    reply_markup=draft.get("buttons")
+                )
             elif draft["type"] == "photo":
-                await context.bot.send_photo(CHANNEL_USERNAME, draft["file_id"], caption=draft["caption"])
+                await context.bot.send_photo(
+                    CHANNEL_USERNAME,
+                    draft["file_id"],
+                    caption=draft["caption"],
+                    reply_markup=draft.get("buttons")
+                )
             elif draft["type"] == "video":
-                await context.bot.send_video(CHANNEL_USERNAME, draft["file_id"], caption=draft["caption"])
+                await context.bot.send_video(
+                    CHANNEL_USERNAME,
+                    draft["file_id"],
+                    caption=draft["caption"],
+                    reply_markup=draft.get("buttons")
+                )
             elif draft["type"] == "audio":
-                await context.bot.send_audio(CHANNEL_USERNAME, draft["file_id"])
+                await context.bot.send_audio(
+                    CHANNEL_USERNAME,
+                    draft["file_id"],
+                    reply_markup=draft.get("buttons")
+                )
 
         context.job_queue.run_once(send_later, when=(dt - datetime.now()))
 
@@ -226,11 +273,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
+    draft = drafts.get(user_id)
+
     if user_id != ADMIN_ID:
         return
-
-    draft = drafts.get(user_id)
-    state = user_states.get(user_id, "IDLE")
 
     # ------------------------------------------------
     # ❌ CANCELAR
@@ -246,7 +292,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ------------------------------------------------
-    # 1️⃣ EDITAR BORRADOR
+    # EDITAR BORRADOR
     # ------------------------------------------------
     if data == "edit_draft":
         if not draft:
@@ -258,62 +304,78 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ------------------------------------------------
-    # 2️⃣ EDITAR ÚLTIMA PUBLICACIÓN ENVIADA
+    # EDITAR ÚLTIMA PUBLICACIÓN (REAL)
     # ------------------------------------------------
     if data == "edit_last":
         if last_post_message_id is None:
-            await query.message.reply_text("Aún no hay publicaciones enviadas.")
+            await query.message.reply_text("No hay publicaciones previas.")
             return
 
         user_states[user_id] = "EDITING_LAST"
         await query.message.reply_text(
-            "Envía el contenido que reemplazará la última publicación."
+            "Envía el contenido nuevo para reemplazar la última publicación."
         )
         return
 
     # ------------------------------------------------
-    # 3️⃣ REHACER DESDE CERO
+    # REHACER
     # ------------------------------------------------
     if data == "edit_reset":
         drafts[user_id] = {}
         user_states[user_id] = "WAITING_CONTENT"
 
         await query.message.reply_text(
-            "Perfecto, envía el nuevo contenido desde cero."
+            "Perfecto, envía el nuevo contenido."
         )
         return
 
     # ------------------------------------------------
-    # 📤 PUBLICAR AHORA
+    # PUBLICAR AHORA
     # ------------------------------------------------
     if data == "publish_now" and draft:
-
         if draft["type"] == "text":
-            msg = await context.bot.send_message(CHANNEL_USERNAME, draft["text"])
+            msg = await context.bot.send_message(
+                CHANNEL_USERNAME,
+                draft["text"],
+                reply_markup=draft.get("buttons")
+            )
         elif draft["type"] == "photo":
-            msg = await context.bot.send_photo(CHANNEL_USERNAME, draft["file_id"], caption=draft["caption"])
+            msg = await context.bot.send_photo(
+                CHANNEL_USERNAME,
+                draft["file_id"],
+                caption=draft["caption"],
+                reply_markup=draft.get("buttons")
+            )
         elif draft["type"] == "video":
-            msg = await context.bot.send_video(CHANNEL_USERNAME, draft["file_id"], caption=draft["caption"])
+            msg = await context.bot.send_video(
+                CHANNEL_USERNAME,
+                draft["file_id"],
+                caption=draft["caption"],
+                reply_markup=draft.get("buttons")
+            )
         elif draft["type"] == "audio":
-            msg = await context.bot.send_audio(CHANNEL_USERNAME, draft["file_id"])
+            msg = await context.bot.send_audio(
+                CHANNEL_USERNAME,
+                draft["file_id"],
+                reply_markup=draft.get("buttons")
+            )
 
-        last_post_message_id = msg.message_id   # <- guardar para edición REAL
-
+        last_post_message_id = msg.message_id
         drafts[user_id] = {}
         user_states[user_id] = "IDLE"
 
         await query.message.reply_text(
-            "✅ Publicación enviada.",
+            "✔ Publicación enviada.",
             reply_markup=get_main_menu_keyboard(),
         )
         return
 
     # ------------------------------------------------
-    # ⏳ BOTÓN PROGRAMAR
+    # PROGRAMAR DESDE BOTÓN
     # ------------------------------------------------
     if data == "schedule":
         user_states[user_id] = "WAITING_DATETIME"
-        await query.message.reply_text("Envía fecha y hora así:\n2025-12-02 18:30")
+        await query.message.reply_text("Envía la fecha y hora:\n2025-12-02 18:30")
         return
 
 
