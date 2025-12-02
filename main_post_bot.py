@@ -26,7 +26,7 @@ TOKEN = os.environ.get("POST_BOT_TOKEN")
 CHANNEL_USERNAME = "@JohaaleTrader_es"
 
 # Solo tú puedes usar este panel (tu ID personal)
-ADMIN_ID = 5924691120  # ya lo tenemos de antes
+ADMIN_ID = 5958164558  # ya lo tenemos de antes
 
 # Estados por usuario
 user_states = {}  # user_id -> estado
@@ -322,3 +322,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
