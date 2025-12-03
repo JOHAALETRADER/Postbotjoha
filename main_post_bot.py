@@ -1,469 +1,281 @@
 import os
 from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-
-# =============================================
-# CONFIGURACIÓN GENERAL
-# =============================================
-
-# El token se toma SOLO de la variable de entorno POST_BOT_TOKEN
 TOKEN = os.environ.get("POST_BOT_TOKEN")
 CHANNEL_USERNAME = "@JohaaleTrader_es"
-ADMIN_ID = 5958164558  # Tu ID
+ADMIN_ID = 5958164558
 
-# Estados y datos en memoria
-user_states = {}        # user_id -> estado
-drafts = {}             # user_id -> borrador de publicación
-button_templates = {}   # nombre -> lista de (texto, url)
+user_states = {}
+drafts = {}
+button_template = []  # lista de (texto, url)
 
 
-# =============================================
-# TECLADOS
-# =============================================
-
-def get_main_menu_keyboard():
-    keyboard = [
+def main_menu():
+    kb = [
         ["📝 Crear publicación"],
-        ["🔗 Botones guardados"],
+        ["✏️ Editar publicación"],
         ["⏰ Programar publicación"],
         ["❌ Cancelar"],
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-
-def get_buttons_menu_keyboard():
-    keyboard = [
-        ["➕ Añadir botón"],
-        ["📋 Ver plantillas"],
-        ["⬅ Volver al menú"],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-# =============================================
-# /START
-# =============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user is None or update.message is None:
+    u = update.effective_user
+    if not u or u.id != ADMIN_ID:
+        if update.message:
+            await update.message.reply_text("Acceso restringido.")
         return
+    user_states[u.id] = "IDLE"
+    await update.message.reply_text("Panel listo. Elige una opción:", reply_markup=main_menu())
 
-    if user.id != ADMIN_ID:
-        await update.message.reply_text("Acceso restringido.")
-        return
-
-    user_states[user.id] = "IDLE"
-    await update.message.reply_text(
-        "Panel listo. Elige una opción:",
-        reply_markup=get_main_menu_keyboard(),
-    )
-
-
-# =============================================
-# MANEJO DE MENSAJES
-# =============================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if message is None:
+    m = update.message
+    if not m or not m.from_user:
+        return
+    uid = m.from_user.id
+    if uid != ADMIN_ID:
+        await m.reply_text("Acceso restringido.")
         return
 
-    user = message.from_user
-    if user is None:
+    txt = m.text or ""
+    state = user_states.get(uid, "IDLE")
+
+    if txt == "/start":
+        user_states[uid] = "IDLE"
+        await m.reply_text("Panel listo. Elige una opción:", reply_markup=main_menu())
         return
 
-    user_id = user.id
-    text = message.text or ""
-    state = user_states.get(user_id, "IDLE")
-
-    # Restringir acceso
-    if user_id != ADMIN_ID:
-        await message.reply_text("Acceso restringido.")
-        return
-
-    # Permitir /start también aquí
-    if text == "/start":
-        user_states[user_id] = "IDLE"
-        await message.reply_text(
-            "Panel listo. Elige una opción:",
-            reply_markup=get_main_menu_keyboard(),
-        )
-        return
-
-    # =========================
-    # ESTADO IDLE (MENÚ)
-    # =========================
+    # ----- MENÚ PRINCIPAL -----
     if state == "IDLE":
-        if text == "📝 Crear publicación":
-            user_states[user_id] = "WAITING_CONTENT"
-            drafts[user_id] = {}
-            await message.reply_text("Envía el contenido (texto o multimedia).")
+        if txt == "📝 Crear publicación":
+            user_states[uid] = "WAITING_CONTENT"
+            drafts[uid] = {}
+            await m.reply_text("Envía el contenido (texto o multimedia).")
             return
 
-        if text == "🔗 Botones guardados":
-            user_states[user_id] = "BUTTONS_MENU"
-            await message.reply_text(
-                "Menú de botones guardados:",
-                reply_markup=get_buttons_menu_keyboard(),
-            )
+        if txt == "✏️ Editar publicación":
+            user_states[uid] = "WAITING_EDIT_MSG"
+            await m.reply_text("Reenvía desde el canal el mensaje a editar.")
             return
 
-        if text == "⏰ Programar publicación":
-            draft = drafts.get(user_id)
-            if not draft:
-                await message.reply_text("Primero crea una publicación.")
+        if txt == "⏰ Programar publicación":
+            d = drafts.get(uid)
+            if not d:
+                await m.reply_text("Primero crea una publicación.")
                 return
-            user_states[user_id] = "WAITING_SCHEDULE"
-            await message.reply_text(
-                "Envía fecha y hora.\n"
-                "Formatos válidos:\n"
-                "2025-12-03 14:30\n"
-                "03/12 14:30"
-            )
+            user_states[uid] = "WAITING_SCHEDULE"
+            await m.reply_text("Envía fecha y hora (2025-12-03 14:30 o 03/12 14:30).")
             return
 
-        if text == "❌ Cancelar":
-            drafts.pop(user_id, None)
-            await message.reply_text(
-                "Acción cancelada.",
-                reply_markup=get_main_menu_keyboard(),
-            )
+        if txt == "❌ Cancelar":
+            drafts.pop(uid, None)
+            await m.reply_text("Acción cancelada.", reply_markup=main_menu())
             return
 
-        # Si escribe otra cosa en IDLE
-        await message.reply_text(
-            "Usa el menú para elegir una opción.",
-            reply_markup=get_main_menu_keyboard(),
-        )
+        await m.reply_text("Usa el menú para elegir una opción.", reply_markup=main_menu())
         return
 
-    # =========================
-    # ESPERANDO CONTENIDO
-    # =========================
+    # ----- CREAR: CONTENIDO -----
     if state == "WAITING_CONTENT":
-        # Aceptamos texto o multimedia con caption
-        drafts[user_id] = {
-            "from_chat_id": message.chat_id,
-            "message_id": message.message_id,
+        drafts[uid] = {
+            "from_chat_id": m.chat_id,
+            "message_id": m.message_id,
             "buttons": None,
         }
-        user_states[user_id] = "WAITING_BUTTONS"
-        await message.reply_text("Añade enlaces y botones (Texto - https://enlace.com).")
+        user_states[uid] = "WAITING_BUTTONS"
+        await m.reply_text("Añade enlaces y botones.")
         return
 
-    # =========================
-    # ESPERANDO BOTONES
-    # =========================
+    # ----- CREAR: BOTONES -----
     if state == "WAITING_BUTTONS":
-        lines = text.splitlines()
-        buttons = []
-
+        lines = txt.splitlines()
+        btns = []
         for line in lines:
             if "-" not in line:
                 continue
             label, url = line.split("-", 1)
-            label = label.strip()
-            url = url.strip()
+            label, url = label.strip(), url.strip()
             if label and url:
-                buttons.append([InlineKeyboardButton(label, url=url)])
-
-        if not buttons:
-            await message.reply_text("No detecté botones válidos. Usa: Texto - https://enlace.com")
+                btns.append([InlineKeyboardButton(label, url=url)])
+        if not btns:
+            await m.reply_text("No detecté botones válidos.")
             return
 
-        markup = InlineKeyboardMarkup(buttons)
-        drafts[user_id]["buttons"] = markup
+        markup = InlineKeyboardMarkup(btns)
+        drafts[uid]["buttons"] = markup
 
         # Vista previa completa
+        d = drafts[uid]
         await context.bot.copy_message(
-            chat_id=message.chat_id,
-            from_chat_id=drafts[user_id]["from_chat_id"],
-            message_id=drafts[user_id]["message_id"],
+            chat_id=m.chat_id,
+            from_chat_id=d["from_chat_id"],
+            message_id=d["message_id"],
             reply_markup=markup,
         )
 
-        keyboard = [
+        kb = [
             ["📤 Publicar ahora"],
             ["⏰ Programar"],
-            ["💾 Guardar botones como plantilla"],
+            ["💾 Guardar botones predet."],
             ["❌ Cancelar"],
         ]
-        user_states[user_id] = "CONFIRM_ACTION"
-        await message.reply_text(
-            "Vista previa lista. Elige una opción:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
-        )
+        user_states[uid] = "CONFIRM_ACTION"
+        await m.reply_text("Vista previa lista. Elige una opción:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
         return
 
-    # =========================
-    # CONFIRMAR ACCIÓN
-    # =========================
+    # ----- CONFIRMAR ACCIÓN -----
     if state == "CONFIRM_ACTION":
-        draft = drafts.get(user_id)
-        if not draft:
-            user_states[user_id] = "IDLE"
-            await message.reply_text(
-                "No hay borrador. Vuelve a crear la publicación.",
-                reply_markup=get_main_menu_keyboard(),
-            )
+        d = drafts.get(uid)
+        if not d:
+            user_states[uid] = "IDLE"
+            await m.reply_text("No hay borrador.", reply_markup=main_menu())
             return
 
-        if text == "📤 Publicar ahora":
-            await context.bot.copy_message(
+        if txt == "📤 Publicar ahora":
+            sent = await context.bot.copy_message(
                 chat_id=CHANNEL_USERNAME,
-                from_chat_id=draft["from_chat_id"],
-                message_id=draft["message_id"],
-                reply_markup=draft.get("buttons"),
+                from_chat_id=d["from_chat_id"],
+                message_id=d["message_id"],
+                reply_markup=d.get("buttons"),
             )
-            user_states[user_id] = "IDLE"
-            await message.reply_text(
-                "Publicación enviada al canal.",
-                reply_markup=get_main_menu_keyboard(),
-            )
+            user_states[uid] = "IDLE"
+            link = "https://t.me/{}/{}".format(CHANNEL_USERNAME.lstrip("@"), sent.message_id)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Ver publicación", url=link)]])
+            await m.reply_text("Publicación enviada.", reply_markup=main_menu())
+            await m.reply_text("Vista en canal:", reply_markup=kb)
             return
 
-        if text == "⏰ Programar":
-            user_states[user_id] = "WAITING_SCHEDULE"
-            await message.reply_text(
-                "Envía fecha y hora.\n"
-                "Formatos válidos:\n"
-                "2025-12-03 14:30\n"
-                "03/12 14:30"
-            )
+        if txt == "⏰ Programar":
+            user_states[uid] = "WAITING_SCHEDULE"
+            await m.reply_text("Envía fecha y hora (2025-12-03 14:30 o 03/12 14:30).")
             return
 
-        if text == "💾 Guardar botones como plantilla":
-            if not draft.get("buttons"):
-                await message.reply_text("No hay botones para guardar.")
+        if txt == "💾 Guardar botones predet.":
+            if not d.get("buttons"):
+                await m.reply_text("No hay botones para guardar.")
                 return
-            user_states[user_id] = "WAITING_TEMPLATE_NAME"
-            await message.reply_text("Escribe un nombre para esta plantilla de botones.")
+            global button_template
+            button_template = []
+            for row in d["buttons"].inline_keyboard:
+                for b in row:
+                    button_template.append((b.text, b.url))
+            user_states[uid] = "IDLE"
+            await m.reply_text("Botones guardados como predeterminados.", reply_markup=main_menu())
             return
 
-        if text == "❌ Cancelar":
-            drafts.pop(user_id, None)
-            user_states[user_id] = "IDLE"
-            await message.reply_text(
-                "Acción cancelada.",
-                reply_markup=get_main_menu_keyboard(),
-            )
+        if txt == "❌ Cancelar":
+            drafts.pop(uid, None)
+            user_states[uid] = "IDLE"
+            await m.reply_text("Acción cancelada.", reply_markup=main_menu())
             return
 
-        await message.reply_text("Elige una opción usando los botones.")
+        await m.reply_text("Elige una opción usando los botones.")
         return
 
-    # =========================
-    # GUARDAR PLANTILLA DE BOTONES
-    # =========================
-    if state == "WAITING_TEMPLATE_NAME":
-        draft = drafts.get(user_id)
-        if not draft or not draft.get("buttons"):
-            user_states[user_id] = "IDLE"
-            await message.reply_text(
-                "No hay botones para guardar.",
-                reply_markup=get_main_menu_keyboard(),
-            )
-            return
-
-        name = text.strip()
-        if not name:
-            await message.reply_text("El nombre no puede estar vacío.")
-            return
-
-        keyboard = draft["buttons"].inline_keyboard
-        data = []
-        for row in keyboard:
-            for btn in row:
-                data.append((btn.text, btn.url))
-
-        button_templates[name] = data
-
-        user_states[user_id] = "IDLE"
-        await message.reply_text(
-            'Plantilla "{}" guardada.'.format(name),
-            reply_markup=get_main_menu_keyboard(),
-        )
-        return
-
-    # =========================
-    # PROGRAMAR PUBLICACIÓN
-    # =========================
+    # ----- PROGRAMAR PUBLICACIÓN -----
     if state == "WAITING_SCHEDULE":
-        draft = drafts.get(user_id)
-        if not draft:
-            user_states[user_id] = "IDLE"
-            await message.reply_text(
-                "No hay borrador actual.",
-                reply_markup=get_main_menu_keyboard(),
-            )
+        d = drafts.get(uid)
+        if not d:
+            user_states[uid] = "IDLE"
+            await m.reply_text("No hay borrador.", reply_markup=main_menu())
             return
 
-        text_clean = text.strip()
-        ahora = datetime.now()
+        s = txt.strip()
+        now = datetime.now()
         dt = None
-
-        # Intento 1 — YYYY-MM-DD HH:MM
         try:
-            dt = datetime.strptime(text_clean, "%Y-%m-%d %H:%M")
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
         except Exception:
-            dt = None
-
-        # Intento 2 — DD/MM HH:MM
-        if dt is None:
             try:
-                fecha_part, hora_part = text_clean.split(" ")
-                d_str, m_str = fecha_part.split("/")
-                h_str, mi_str = hora_part.split(":")
-                d = int(d_str)
-                m = int(m_str)
-                h = int(h_str)
-                mi = int(mi_str)
-                dt = datetime(ahora.year, m, d, h, mi)
+                fecha, hora = s.split(" ")
+                d_str, m_str = fecha.split("/")
+                h_str, mi_str = hora.split(":")
+                d_i, m_i, h_i, mi_i = int(d_str), int(m_str), int(h_str), int(mi_str)
+                dt = datetime(now.year, m_i, d_i, h_i, mi_i)
             except Exception:
                 dt = None
 
         if dt is None:
-            await message.reply_text(
-                "Formato inválido.\nUsa:\n"
-                "2025-12-03 14:30\n"
-                "03/12 14:30"
-            )
+            await m.reply_text("Formato inválido. Usa 2025-12-03 14:30 o 03/12 14:30.")
             return
 
-        if dt <= ahora:
+        if dt <= now:
             dt = dt + timedelta(days=1)
 
         job_data = {
-            "from_chat_id": draft["from_chat_id"],
-            "message_id": draft["message_id"],
-            "buttons": draft.get("buttons"),
+            "from_chat_id": d["from_chat_id"],
+            "message_id": d["message_id"],
+            "buttons": d.get("buttons"),
         }
-
-        context.job_queue.run_once(
-            send_scheduled_post,
-            when=dt,
-            data=job_data,
-        )
-
-        user_states[user_id] = "IDLE"
-        await message.reply_text(
+        context.job_queue.run_once(send_scheduled_post, when=dt, data=job_data)
+        user_states[uid] = "IDLE"
+        await m.reply_text(
             "Publicación programada para {} a las {}.".format(
-                dt.strftime("%d/%m"),
-                dt.strftime("%H:%M"),
+                dt.strftime("%d/%m"), dt.strftime("%H:%M")
             ),
-            reply_markup=get_main_menu_keyboard(),
+            reply_markup=main_menu(),
         )
         return
 
-    # =========================
-    # MENÚ DE BOTONES GUARDADOS
-    # =========================
-    if state == "BUTTONS_MENU":
-        if text == "➕ Añadir botón":
-            user_states[user_id] = "BUTTON_ADD"
-            await message.reply_text(
-                "Envía el botón en formato:\nTexto - https://enlace.com\n"
-                "Se guardará en la plantilla DEFAULT."
-            )
+    # ----- EDITAR PUBLICACIÓN -----
+    if state == "WAITING_EDIT_MSG":
+        if not (m.forward_from_chat and m.forward_from_chat.username == CHANNEL_USERNAME.lstrip("@")):
+            await m.reply_text("Reenvía un mensaje del canal {}.".format(CHANNEL_USERNAME))
             return
+        drafts[uid] = {
+            "edit_chat_id": m.forward_from_chat.id,
+            "edit_message_id": m.forward_from_message_id,
+        }
+        user_states[uid] = "WAITING_EDIT_TEXT"
+        await m.reply_text("Envía el nuevo texto/caption para la publicación.")
+        return
 
-        if text == "📋 Ver plantillas":
-            if not button_templates:
-                await message.reply_text("No hay plantillas guardadas.")
+    if state == "WAITING_EDIT_TEXT":
+        d = drafts.get(uid)
+        if not d:
+            user_states[uid] = "IDLE"
+            await m.reply_text("No hay mensaje a editar.", reply_markup=main_menu())
+            return
+        chat_id = d["edit_chat_id"]
+        msg_id = d["edit_message_id"]
+        # Intentar editar como texto, si falla, como caption
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=txt)
+        except Exception:
+            try:
+                await context.bot.edit_message_caption(chat_id=chat_id, message_id=msg_id, caption=txt)
+            except Exception:
+                await m.reply_text("No pude editar el mensaje.")
+                user_states[uid] = "IDLE"
                 return
-            lines = []
-            for name, data in button_templates.items():
-                lines.append("- {} ({} botones)".format(name, len(data)))
-            await message.reply_text("Plantillas:\n" + "\n".join(lines))
-            return
-
-        if text == "⬅ Volver al menú":
-            user_states[user_id] = "IDLE"
-            await message.reply_text(
-                "Volviendo al menú principal.",
-                reply_markup=get_main_menu_keyboard(),
-            )
-            return
-
-        await message.reply_text(
-            "Elige una opción del menú de botones.",
-            reply_markup=get_buttons_menu_keyboard(),
-        )
+        user_states[uid] = "IDLE"
+        await m.reply_text("Publicación editada.", reply_markup=main_menu())
         return
 
-    # =========================
-    # AÑADIR BOTÓN A PLANTILLA DEFAULT
-    # =========================
-    if state == "BUTTON_ADD":
-        if "-" not in text:
-            await message.reply_text("Formato inválido. Usa: Texto - https://enlace.com")
-            return
+    # Cualquier cosa rara: reset
+    user_states[uid] = "IDLE"
+    await m.reply_text("Estado reiniciado.", reply_markup=main_menu())
 
-        label, url = text.split("-", 1)
-        label = label.strip()
-        url = url.strip()
-
-        if not label or not url:
-            await message.reply_text("Texto o enlace vacío. Intenta de nuevo.")
-            return
-
-        data = button_templates.get("DEFAULT", [])
-        data.append((label, url))
-        button_templates["DEFAULT"] = data
-
-        user_states[user_id] = "BUTTONS_MENU"
-        await message.reply_text(
-            "Botón añadido a la plantilla DEFAULT.",
-            reply_markup=get_buttons_menu_keyboard(),
-        )
-        return
-
-    # Si cae en un estado desconocido, reset
-    user_states[user_id] = "IDLE"
-    await message.reply_text(
-        "Estado no reconocido. Volviendo al menú.",
-        reply_markup=get_main_menu_keyboard(),
-    )
-
-
-# =============================================
-# ENVÍO PROGRAMADO
-# =============================================
 
 async def send_scheduled_post(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    if not data:
+    d = context.job.data
+    if not d:
         return
     await context.bot.copy_message(
         chat_id=CHANNEL_USERNAME,
-        from_chat_id=data["from_chat_id"],
-        message_id=data["message_id"],
-        reply_markup=data.get("buttons"),
+        from_chat_id=d["from_chat_id"],
+        message_id=d["message_id"],
+        reply_markup=d.get("buttons"),
     )
 
 
-# =============================================
-# MAIN
-# =============================================
-
 def main():
     if not TOKEN:
-        raise RuntimeError("La variable POST_BOT_TOKEN no está configurada.")
-
+        raise RuntimeError("POST_BOT_TOKEN no está configurado.")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
