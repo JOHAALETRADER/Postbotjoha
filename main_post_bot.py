@@ -21,7 +21,7 @@ from telegram.ext import (
 
 TOKEN = os.environ.get("POST_BOT_TOKEN")
 CHANNEL_USERNAME = "@JohaaleTrader_es"
-ADMIN_ID = 5924691120  # tu ID personal
+ADMIN_ID = 5958164558  # tu ID personal
 
 # Estado del usuario
 user_states = {}
@@ -324,3 +324,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
