@@ -144,7 +144,7 @@ def build_main_menu_text(user_id: int) -> str:
 def build_main_menu_keyboard() -> List[List[InlineKeyboardButton]]:
     keyboard = [
         [
-            InlineKeyboardButton("📝 Ver borrador actual", callback_data="SHOW_DRAFT")
+            InlineKeyboardButton("📝 Ver borrador actual", callback_data="SHOW_DRAFT"),
         ],
         [
             InlineKeyboardButton("✏️ Crear / cambiar publicación", callback_data="MENU_CREATE"),
@@ -515,7 +515,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=" ",
+                text="Selecciona una opción:",
                 reply_markup=InlineKeyboardMarkup(buttons_after_send),
             )
         await send_main_menu_simple(context, chat_id, user_id)
@@ -989,11 +989,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
     # --- Edición desde menú Editar ---
-    
     elif data == "SHOW_DRAFT":
-        await send_draft_preview(user_id, chat_id, context)
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador actualmente.",
+            )
+        else:
+            await send_draft_preview(user_id, chat_id, context)
         await send_main_menu_simple(context, chat_id, user_id)
-elif data == "EDIT_TEXT":
+
+    elif data == "EDIT_TEXT":
         draft = get_draft(user_id)
         if not draft_has_content(draft):
             await context.bot.send_message(
@@ -1538,7 +1545,7 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
         ]
         await context.bot.send_message(
             chat_id=user_id,
-            text=" ",
+            text="Selecciona una opción:",
             reply_markup=InlineKeyboardMarkup(buttons_after_send),
         )
     except Exception as exc:
