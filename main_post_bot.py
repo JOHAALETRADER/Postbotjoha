@@ -528,9 +528,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 text="Así se publicó en el canal:",
             )
-            await send_draft_preview(user_id, chat_id, context)
-
-            # Botones para ver la publicación en el canal y volver al menú
+# Botones para ver la publicación en el canal y volver al menú
             buttons_after_send = [
                 [InlineKeyboardButton("Ver publicación en el canal", url="https://t.me/JohaaleTrader_es")],
                 [InlineKeyboardButton("Volver al menú", callback_data="BACK_TO_MENU")],
@@ -670,8 +668,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 text="Botones predeterminados aplicados al borrador.",
             )
-            await send_draft_preview(user_id, chat_id, context)
-            await context.bot.send_message(
+await context.bot.send_message(
                 chat_id=chat_id,
                 text="¿Qué quieres hacer ahora?",
                 reply_markup=InlineKeyboardMarkup(build_final_action_keyboard()),
@@ -885,8 +882,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             text="Plantilla insertada en el borrador.",
         )
-        await send_draft_preview(user_id, chat_id, context)
-        await send_main_menu_simple(context, chat_id, user_id)
+await send_main_menu_simple(context, chat_id, user_id)
 
     elif data == "TEMPLATE_DELETE":
         templates = get_templates(user_id)
@@ -1080,10 +1076,7 @@ async def _after_buttons_flow(
     context.user_data["state"] = None
     buttons_context = context.user_data.get("buttons_context")
     after_action = context.user_data.get("after_buttons_action")
-
-    await send_draft_preview(user_id, chat_id, context)
-
-    if after_action == "FINAL_MENU" or buttons_context in ("from_new", "from_edit_menu"):
+if after_action == "FINAL_MENU" or buttons_context in ("from_new", "from_edit_menu"):
         await context.bot.send_message(
             chat_id=chat_id,
             text="¿Qué quieres hacer ahora?",
@@ -1341,8 +1334,7 @@ async def handle_edit_text(
         chat_id=chat_id,
         text="Texto del borrador actualizado.",
     )
-    await send_draft_preview(user_id, chat_id, context)
-    await context.bot.send_message(
+await context.bot.send_message(
         chat_id=chat_id,
         text="¿Qué quieres hacer ahora?",
         reply_markup=InlineKeyboardMarkup(build_final_action_keyboard()),
@@ -1395,8 +1387,7 @@ async def handle_new_media(
         chat_id=chat_id,
         text="Media del borrador actualizada.",
     )
-    await send_draft_preview(user_id, chat_id, context)
-    await context.bot.send_message(
+await context.bot.send_message(
         chat_id=chat_id,
         text="¿Qué quieres hacer ahora?",
         reply_markup=InlineKeyboardMarkup(build_final_action_keyboard()),
@@ -1439,8 +1430,7 @@ async def handle_delete_button_index(
         chat_id=chat_id,
         text=f"Botón '{removed[0].text}' eliminado.",
     )
-    await send_draft_preview(user_id, chat_id, context)
-    await send_main_menu_simple(context, chat_id, user_id)
+await send_main_menu_simple(context, chat_id, user_id)
 
 
 async def handle_delete_template_index(
@@ -1543,9 +1533,7 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
             chat_id=user_id,
             text="Así se publicó en el canal:",
         )
-        await send_draft_preview(user_id, user_id, context)
-
-        # Botones para ver la publicación en el canal y volver al menú
+# Botones para ver la publicación en el canal y volver al menú
         buttons_after_send = [
             [InlineKeyboardButton("Ver publicación en el canal", url="https://t.me/JohaaleTrader_es")],
             [InlineKeyboardButton("Volver al menú", callback_data="BACK_TO_MENU")],
