@@ -79,7 +79,6 @@ def build_main_menu_text(user_id: int) -> str:
     has_template = bool((defaults.get("template_text") or "").strip())
 
     text_menu = (
-        "📌 BOT AVANZADO – OPCIÓN A\n\n"
         "Borrador actual:\n"
         "{resumen}\n\n"
         "Botones: {botones}\n"
