@@ -305,9 +305,9 @@ async def send_draft_preview(
 async def send_publication_to_target(
     draft: Dict[str, Any],
     context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+) -> Any:
     if not draft_has_content(draft):
-        return
+        return None
 
     buttons = draft.get("buttons") or []
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
@@ -315,33 +315,38 @@ async def send_publication_to_target(
     content_type = draft.get("type")
     file_id = draft.get("file_id")
 
+    message = None
+
     if content_type == "photo" and file_id:
-        await context.bot.send_photo(
+        message = await context.bot.send_photo(
             chat_id=TARGET_CHAT_ID,
             photo=file_id,
             caption=text,
             reply_markup=reply_markup,
         )
     elif content_type == "video" and file_id:
-        await context.bot.send_video(
+        message = await context.bot.send_video(
             chat_id=TARGET_CHAT_ID,
             video=file_id,
             caption=text,
             reply_markup=reply_markup,
         )
     elif content_type == "voice" and file_id:
-        await context.bot.send_voice(
+        message = await context.bot.send_voice(
             chat_id=TARGET_CHAT_ID,
             voice=file_id,
             caption=text,
             reply_markup=reply_markup,
         )
     else:
-        await context.bot.send_message(
+        message = await context.bot.send_message(
             chat_id=TARGET_CHAT_ID,
             text=text if text else "(Publicación sin texto)",
             reply_markup=reply_markup,
         )
+
+    return message
+
 
 
 # --------- Comandos ---------
@@ -519,18 +524,26 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 draft["job"] = None
                 draft["scheduled_at"] = None
 
-            await send_publication_to_target(draft, context)
+            message = await send_publication_to_target(draft, context)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="✅ Publicación enviada al canal.",
             )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Así se publicó en el canal:",
-            )
-# Botones para ver la publicación en el canal y volver al menú
+
+            post_id = None
+            try:
+                if message is not None:
+                    post_id = message.message_id
+            except Exception:
+                post_id = None
+
+            base_url = "https://t.me/JohaaleTrader_es"
+            url = base_url
+            if post_id is not None:
+                url = f"{base_url}/{post_id}"
+
             buttons_after_send = [
-                [InlineKeyboardButton("Ver publicación en el canal", url="https://t.me/JohaaleTrader_es")],
+                [InlineKeyboardButton("🔗 Así se publicó en el canal", url=url)],
                 [InlineKeyboardButton("Volver al menú", callback_data="BACK_TO_MENU")],
             ]
             await context.bot.send_message(
@@ -1528,20 +1541,28 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     try:
-        await send_publication_to_target(draft, context)  # type: ignore[arg-type]
+        message = await send_publication_to_target(draft, context)  # type: ignore[arg-type]
         draft["scheduled_at"] = None
         draft["job"] = None
         await context.bot.send_message(
             chat_id=user_id,
             text="✅ Publicación programada enviada correctamente al canal.",
         )
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="Así se publicó en el canal:",
-        )
-# Botones para ver la publicación en el canal y volver al menú
+
+        post_id = None
+        try:
+            if message is not None:
+                post_id = message.message_id
+        except Exception:
+            post_id = None
+
+        base_url = "https://t.me/JohaaleTrader_es"
+        url = base_url
+        if post_id is not None:
+            url = f"{base_url}/{post_id}"
+
         buttons_after_send = [
-            [InlineKeyboardButton("Ver publicación en el canal", url="https://t.me/JohaaleTrader_es")],
+            [InlineKeyboardButton("🔗 Así se publicó en el canal", url=url)],
             [InlineKeyboardButton("Volver al menú", callback_data="BACK_TO_MENU")],
         ]
         await context.bot.send_message(
