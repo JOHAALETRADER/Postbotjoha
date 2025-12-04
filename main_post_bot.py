@@ -668,6 +668,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 text="Botones predeterminados aplicados al borrador.",
             )
+            await send_draft_preview(user_id, chat_id, context)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="¿Qué quieres hacer ahora?",
@@ -1076,7 +1077,9 @@ async def _after_buttons_flow(
     context.user_data["state"] = None
     buttons_context = context.user_data.get("buttons_context")
     after_action = context.user_data.get("after_buttons_action")
+
     if after_action == "FINAL_MENU" or buttons_context in ("from_new", "from_edit_menu"):
+        await send_draft_preview(user_id, chat_id, context)
         await context.bot.send_message(
             chat_id=chat_id,
             text="¿Qué quieres hacer ahora?",
@@ -1086,6 +1089,7 @@ async def _after_buttons_flow(
         await send_main_menu_simple(context, chat_id, user_id)
 
     context.user_data.pop("buttons_context", None)
+    context.user_data.pop("after_buttons_action", None)
 
 
 # --------- Parsers ---------
