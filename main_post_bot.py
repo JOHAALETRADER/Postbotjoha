@@ -548,7 +548,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=" ",
+                text="Selecciona una opción:",
                 reply_markup=InlineKeyboardMarkup(buttons_after_send),
             )
         await send_main_menu_simple(context, chat_id, user_id)
@@ -1567,7 +1567,7 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
         ]
         await context.bot.send_message(
             chat_id=user_id,
-            text=" ",
+            text="Selecciona una opción:",
             reply_markup=InlineKeyboardMarkup(buttons_after_send),
         )
     except Exception as exc:
