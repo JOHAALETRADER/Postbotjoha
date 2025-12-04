@@ -18,6 +18,7 @@ from telegram.ext import (
     filters,
 )
 
+# Estructuras en memoria
 DRAFTS: Dict[int, Dict[str, Any]] = {}
 DEFAULTS: Dict[int, Dict[str, Any]] = {}
 
@@ -359,7 +360,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             text="Botones guardados como predeterminados.",
         )
-        await send_draft_preview(user_id, chat_id, context)
         await send_main_menu_simple(context, chat_id, user_id)
 
     elif data == "SAVE_BUTTONS_NO":
@@ -369,7 +369,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             text="Botones usados solo en este borrador.",
         )
-        await send_draft_preview(user_id, chat_id, context)
         await send_main_menu_simple(context, chat_id, user_id)
 
     elif data == "MENU_SCHEDULE":
@@ -699,7 +698,6 @@ async def handle_new_publication_message(
         chat_id=chat_id,
         text="Publicación guardada en el borrador.",
     )
-    await send_draft_preview(user_id, chat_id, context)
 
     keyboard = [
         [
@@ -748,6 +746,7 @@ async def handle_new_buttons_text(
         chat_id=chat_id,
         text="Botones actualizados en el borrador.",
     )
+    # ÚNICA vista previa completa después de definir botones
     await send_draft_preview(user_id, chat_id, context)
 
     context.user_data["state"] = "AWAITING_SAVE_DEFAULT_BUTTONS_CHOICE"
@@ -795,12 +794,16 @@ async def handle_schedule_datetime(
 
     now = datetime.now()
     delta = (scheduled_dt - now).total_seconds()
-    if delta <= 0:
+
+    # Permitimos pequeños desfases de reloj; solo rechazamos si está claramente en el pasado
+    if delta <= -60:
         await context.bot.send_message(
             chat_id=chat_id,
             text="La fecha y hora deben ser futuras.",
         )
         return
+
+    delay = max(delta, 1.0)
 
     if draft.get("job") is not None:
         try:
@@ -811,7 +814,7 @@ async def handle_schedule_datetime(
 
     job = context.application.job_queue.run_once(
         send_scheduled_publication,
-        delta,
+        delay,
         data={"user_id": user_id},
     )
 
@@ -821,9 +824,11 @@ async def handle_schedule_datetime(
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="Publicación programada correctamente.",
+        text=(
+            "✅ Publicación programada para "
+            f"{scheduled_dt.strftime('%Y-%m-%d %H:%M')}."
+        ),
     )
-    await send_draft_preview(user_id, chat_id, context)
 
     keyboard = [
         [
@@ -835,7 +840,7 @@ async def handle_schedule_datetime(
     ]
     await context.bot.send_message(
         chat_id=chat_id,
-        text="Usa el botón para volver al menú cuando quieras.",
+        text="Puedes volver al menú cuando quieras.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
