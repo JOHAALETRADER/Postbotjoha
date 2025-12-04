@@ -282,7 +282,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ),
         )
 
-    elif data == "MENU_BUTTONS":
+    elif data == "MENU_BUTTONS" or data == "ADD_BUTTONS_AFTER_NEW":
         defaults = get_defaults(user_id)
         if defaults.get("buttons"):
             keyboard = [
@@ -700,7 +700,26 @@ async def handle_new_publication_message(
         text="Publicación guardada en el borrador.",
     )
     await send_draft_preview(user_id, chat_id, context)
-    await send_main_menu_simple(context, chat_id, user_id)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "➕ Añadir / editar botones",
+                callback_data="ADD_BUTTONS_AFTER_NEW",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Volver al menú",
+                callback_data="BACK_TO_MENU",
+            )
+        ],
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="¿Quieres añadir botones a esta publicación?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def handle_new_buttons_text(
