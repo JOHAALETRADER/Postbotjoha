@@ -187,6 +187,9 @@ def build_buttons_menu_keyboard() -> List[List[InlineKeyboardButton]]:
             InlineKeyboardButton("💾 Guardar actuales como predeterminados", callback_data="BUTTONS_MENU_SAVE_DEFAULTS"),
         ],
         [
+            InlineKeyboardButton("📝 Ver botones guardados", callback_data="BUTTONS_MENU_VIEW_SAVED"),
+        ],
+        [
             InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU"),
         ],
     ]
@@ -764,6 +767,31 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         await send_main_menu_simple(context, chat_id, user_id)
 
+    elif data == "BUTTONS_MENU_VIEW_SAVED":
+        defaults = get_defaults(user_id)
+        saved_buttons = defaults.get("buttons") or []
+        if not saved_buttons:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay botones predeterminados guardados.",
+            )
+        else:
+            lines = []
+            for idx, row in enumerate(saved_buttons, start=1):
+                # Cada fila es una lista de InlineKeyboardButton; mostramos solo el primero
+                btn = row[0]
+                lines.append(f"{idx}. {btn.text} - {btn.url}")
+            listing = "\n".join(lines)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Botones predeterminados guardados:\n{listing}",
+            )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Opciones de botones:",
+            reply_markup=InlineKeyboardMarkup(build_buttons_menu_keyboard()),
+        )
+
     # --- Guardar o no como predeterminados tras crear botones ---
     elif data == "SAVE_BUTTONS_YES":
         draft = get_draft(user_id)
@@ -1299,15 +1327,6 @@ async def handle_schedule_datetime(
             "✅ Publicación programada para "
             f"{scheduled_local.strftime('%Y-%m-%d %H:%M')}."
         ),
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU")]
-    ]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Puedes volver al menú cuando quieras.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
