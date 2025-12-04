@@ -643,10 +643,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             name="scheduled_post",
         )
         ud[SCHEDULE_JOB_KEY] = job
-        ud[STATE_KEY] = STATE_MAIN_MENU
-
         await msg.reply_text(f"📅 Publicación programada para {dt.strftime('%Y-%m-%d %H:%M')}")
-        return await send_preview(update, context, "Vista previa de la publicación programada:")
+
+# MOSTRAR SOLO LA VISTA PREVIA, NO REGRESAR AL MENÚ
+return await send_preview(update, context, "Vista previa de la publicación programada:")
+
 
     # Estado por defecto
     await msg.reply_text("Usa el menú para gestionar tus publicaciones.")
