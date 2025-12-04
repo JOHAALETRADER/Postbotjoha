@@ -19,7 +19,7 @@ from telegram.ext import (
     filters,
 )
 
-# ================== CONFIG ==================
+# ========= CONFIG =========
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = os.getenv("ADMIN_ID", "")
@@ -36,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# keys user_data
+# user_data keys
 DRAFT_KEY = "draft"
 STATE_KEY = "state"
 DEFAULT_BUTTONS_KEY = "default_buttons"
@@ -55,12 +55,12 @@ STATE_BUTTON_DELETE_SELECT = "BUTTON_DELETE_SELECT"
 STATE_WAITING_SCHEDULE = "WAITING_SCHEDULE"
 
 
-# ================ HELPERS ==================
+# ========= HELPERS =========
 
 def get_draft(ud: Dict[str, Any]) -> Dict[str, Any]:
     if DRAFT_KEY not in ud:
         ud[DRAFT_KEY] = {
-            "type": None,        # "photo", "video", "audio", "voice", "text"
+            "type": None,        # "photo","video","audio","voice","text"
             "file_id": None,
             "text": None,
             "buttons": [],       # list[{"text","url"}]
@@ -76,14 +76,13 @@ def get_default_buttons(ud: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 def build_buttons_keyboard(buttons: List[Dict[str, str]]) -> Optional[InlineKeyboardMarkup]:
-    # siempre 1 botón por fila
     if not buttons:
         return None
     rows = [[InlineKeyboardButton(b["text"], url=b["url"])] for b in buttons]
     return InlineKeyboardMarkup(rows)
 
 
-# ================ MENÚ PRINCIPAL ==================
+# ========= MENÚ PRINCIPAL =========
 
 async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ud = context.user_data
@@ -124,7 +123,7 @@ async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_chat.send_message(msg, parse_mode="Markdown", reply_markup=markup)
 
 
-# ================ /START ==================
+# ========= /START =========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if str(update.effective_user.id) != str(ADMIN_ID):
@@ -134,7 +133,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_main_menu(update, context)
 
 
-# ================ CALLBACK MENÚ ==================
+# ========= CALLBACK MENÚ =========
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -148,28 +147,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     draft = get_draft(ud)
     defaults = get_default_buttons(ud)
 
-    # volver
     if data == "BACK_MAIN":
         return await send_main_menu(update, context)
 
-    # crear
     if data == "CREATE_PUBLICATION":
         ud[DRAFT_KEY] = {"type": None, "file_id": None, "text": None, "buttons": [], "scheduled_at": None}
         ud[STATE_KEY] = STATE_WAITING_PUBLICATION
         return await q.edit_message_text(
-            "Crea tu publicación:\n\n"
-            "Envía *en un solo mensaje* tu imagen / video / audio / nota de voz con texto,\n"
-            "o solo texto.",
+            "Envía tu publicación (imagen/video/audio/nota de voz + texto, o solo texto).",
             parse_mode="Markdown",
         )
 
-    # editar publicación
     if data == "EDIT_PUBLICATION":
         if not draft["text"] and not draft["file_id"]:
             await q.edit_message_text("No hay publicación para editar.")
             return await send_main_menu(update, context)
         kb = [
-            [InlineKeyboardButton("✏️ Editar texto / contenido", callback_data="EDIT_TEXT")],
+            [InlineKeyboardButton("✏️ Editar texto/multimedia", callback_data="EDIT_TEXT")],
             [InlineKeyboardButton("🔗 Editar botones", callback_data="MENU_BUTTONS")],
             [InlineKeyboardButton("⬅️ Volver", callback_data="BACK_MAIN")],
         ]
@@ -177,12 +171,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if data == "EDIT_TEXT":
         ud[STATE_KEY] = STATE_WAITING_PUBLICATION
-        return await q.edit_message_text(
-            "Envía nuevamente la publicación (texto + multimedia opcional).\n"
-            "Reemplazará al borrador actual."
-        )
+        return await q.edit_message_text("Envía la nueva publicación (texto + multimedia).")
 
-    # menú de botones
     if data == "MENU_BUTTONS":
         ud[STATE_KEY] = "BTN_MENU"
         lista = "Sin botones." if not draft["buttons"] else "\n".join(
@@ -192,7 +182,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             [InlineKeyboardButton("➕ Añadir botón", callback_data="BTN_ADD")],
             [InlineKeyboardButton("✏️ Editar botón", callback_data="BTN_EDIT")],
             [InlineKeyboardButton("❌ Eliminar botón", callback_data="BTN_DELETE")],
-            [InlineKeyboardButton("⭐ Guardar como predeterminados", callback_data="BTN_SAVE_DEFAULT")],
+            [InlineKeyboardButton("⭐ Guardar predeterminados", callback_data="BTN_SAVE_DEFAULT")],
             [InlineKeyboardButton("⬅️ Volver", callback_data="BACK_MAIN")],
         ]
         return await q.edit_message_text(
@@ -204,11 +194,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data == "BTN_ADD":
         ud[STATE_KEY] = STATE_WAITING_BUTTONS
         return await q.edit_message_text(
-            "Ahora envía los botones.\n\n"
-            "- Un botón por mensaje, o\n"
-            "- Varios botones en un solo mensaje (uno por línea)\n\n"
-            "Formato: Texto - enlace\n"
-            "Escribe *listo* cuando termines.",
+            "Envía botones (uno por línea o por mensaje).\nFormato: Texto - enlace.\n\nEscribe *listo* cuando acabes.",
             parse_mode="Markdown",
         )
 
@@ -218,7 +204,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return await send_main_menu(update, context)
         ud[STATE_KEY] = STATE_BUTTON_EDIT_SELECT
         lista = "\n".join(f"{i+1}. {b['text']} → {b['url']}" for i, b in enumerate(draft["buttons"]))
-        return await q.edit_message_text(f"¿Qué botón deseas editar?\n\n{lista}")
+        return await q.edit_message_text(f"¿Cuál deseas editar?\n\n{lista}")
 
     if data == "BTN_DELETE":
         if not draft["buttons"]:
@@ -226,29 +212,26 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return await send_main_menu(update, context)
         ud[STATE_KEY] = STATE_BUTTON_DELETE_SELECT
         lista = "\n".join(f"{i+1}. {b['text']} → {b['url']}" for i, b in enumerate(draft["buttons"]))
-        return await q.edit_message_text(f"¿Qué botón deseas eliminar?\n\n{lista}")
+        return await q.edit_message_text(f"¿Cuál deseas eliminar?\n\n{lista}")
 
     if data == "BTN_SAVE_DEFAULT":
         if not draft["buttons"]:
-            await q.edit_message_text("No hay botones que guardar.")
+            await q.edit_message_text("No hay botones para guardar.")
             return await send_main_menu(update, context)
         ud[DEFAULT_BUTTONS_KEY] = list(draft["buttons"])
-        await q.edit_message_text("Botones guardados como predeterminados.")
+        await q.edit_message_text("Botones predeterminados guardados.")
         return await send_main_menu(update, context)
 
-    # plantilla
     if data == "MENU_TEMPLATE":
-        tpl = ud.get(TEMPLATE_TEXT_KEY) or "(Sin plantilla guardada)"
+        tpl = ud.get(TEMPLATE_TEXT_KEY) or "(Sin plantilla)"
         kb = [
-            [InlineKeyboardButton("💾 Guardar borrador como plantilla", callback_data="TPL_SAVE")],
+            [InlineKeyboardButton("💾 Guardar plantilla", callback_data="TPL_SAVE")],
             [InlineKeyboardButton("📥 Insertar plantilla", callback_data="TPL_INSERT")],
             [InlineKeyboardButton("🗑️ Borrar plantilla", callback_data="TPL_CLEAR")],
             [InlineKeyboardButton("⬅️ Volver", callback_data="BACK_MAIN")],
         ]
         return await q.edit_message_text(
-            f"*Plantilla actual:*\n{tpl}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb),
+            f"*Plantilla actual:*\n{tpl}", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
         )
 
     if data == "TPL_SAVE":
@@ -263,21 +246,20 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         tpl = ud.get(TEMPLATE_TEXT_KEY)
         if not tpl:
             await q.edit_message_text("No hay plantilla guardada.")
-        else:
-            draft["text"] = tpl
-            await q.edit_message_text("Plantilla insertada en el borrador.")
-        return await send_main_menu(update, context)
+            return await send_main_menu(update, context)
+        draft["text"] = tpl
+        await q.edit_message_text("📌 Plantilla insertada.")
+        return await send_preview(update, context, "Vista previa:")
 
     if data == "TPL_CLEAR":
         ud[TEMPLATE_TEXT_KEY] = None
         await q.edit_message_text("Plantilla borrada.")
         return await send_main_menu(update, context)
 
-    # programar / enviar
     if data == "MENU_SCHEDULE":
         ud[STATE_KEY] = STATE_WAITING_SCHEDULE
         return await q.edit_message_text(
-            "Indica fecha y hora para programar.\nFormato: AAAA-MM-DD HH:MM"
+            "Indica fecha y hora:\nFormato: AAAA-MM-DD HH:MM"
         )
 
     if data == "MENU_SEND_NOW":
@@ -289,16 +271,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data == "PREVIEW_SCHEDULE":
         ud[STATE_KEY] = STATE_WAITING_SCHEDULE
         return await q.edit_message_text(
-            "Indica fecha y hora para programar.\nFormato: AAAA-MM-DD HH:MM"
+            "Indica fecha y hora:\nFormato: AAAA-MM-DD HH:MM"
         )
 
     if data == "PREVIEW_EDIT":
-        # reutilizamos EDIT_PUBLICATION
-        if not draft["text"] and not draft["file_id"]:
-            await q.edit_message_text("No hay publicación para editar.")
-            return await send_main_menu(update, context)
         kb = [
-            [InlineKeyboardButton("✏️ Editar texto / contenido", callback_data="EDIT_TEXT")],
+            [InlineKeyboardButton("✏️ Editar texto/multimedia", callback_data="EDIT_TEXT")],
             [InlineKeyboardButton("🔗 Editar botones", callback_data="MENU_BUTTONS")],
             [InlineKeyboardButton("⬅️ Volver", callback_data="BACK_MAIN")],
         ]
@@ -306,38 +284,32 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if data == "PREVIEW_CANCEL":
         ud[DRAFT_KEY] = {"type": None, "file_id": None, "text": None, "buttons": [], "scheduled_at": None}
-        await q.edit_message_text("Borrador cancelado.")
+        await q.edit_message_text("❌ Borrador cancelado.")
         return await send_main_menu(update, context)
 
-    # guardar botones como predeterminados desde el flujo de creación
     if data == "SAVE_DEFAULT_YES":
         ud[DEFAULT_BUTTONS_KEY] = list(draft["buttons"])
-        ud[STATE_KEY] = STATE_MAIN_MENU
-        await q.edit_message_text("Botones guardados como predeterminados.")
+        await q.edit_message_text("Botones guardados.")
         return await send_preview(update, context)
 
     if data == "SAVE_DEFAULT_NO":
-        ud[STATE_KEY] = STATE_MAIN_MENU
-        await q.edit_message_text("Botones no guardados como predeterminados.")
+        await q.edit_message_text("Botones no guardados.")
         return await send_preview(update, context)
 
-    # usar default después de crear publicación
     if data == "USE_DEFAULT_BTNS":
         draft["buttons"] = list(defaults)
-        ud[STATE_KEY] = STATE_MAIN_MENU
         await q.edit_message_text("Botones predeterminados aplicados.")
         return await send_preview(update, context)
 
     if data == "CREATE_NEW_BTNS":
         ud[STATE_KEY] = STATE_WAITING_BUTTONS
         return await q.edit_message_text(
-            "Envía los botones (uno por mensaje o varios por línea).\n"
-            "Formato: Texto - enlace\nEscribe *listo* cuando termines.",
+            "Envía botones (uno por línea o por mensaje).\nFormato: Texto - enlace.",
             parse_mode="Markdown",
         )
 
 
-# ================ PREVIEW ==================
+# ========= PREVIEW =========
 
 async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, intro: str = "📎 Vista previa:") -> None:
     chat = update.effective_chat
@@ -352,15 +324,15 @@ async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, intro
     text = draft["text"] or ""
 
     if t == "photo" and fid:
-        await chat.send_photo(photo=fid, caption=text, reply_markup=kb, parse_mode="HTML")
+        await chat.send_photo(photo=fid, caption=text if text.strip() else None, reply_markup=kb)
     elif t == "video" and fid:
-        await chat.send_video(video=fid, caption=text, reply_markup=kb, parse_mode="HTML")
+        await chat.send_video(video=fid, caption=text if text.strip() else None, reply_markup=kb)
     elif t == "audio" and fid:
-        await chat.send_audio(audio=fid, caption=text, reply_markup=kb, parse_mode="HTML")
+        await chat.send_audio(audio=fid, caption=text if text.strip() else None, reply_markup=kb)
     elif t == "voice" and fid:
-        await chat.send_voice(voice=fid, caption=text, reply_markup=kb, parse_mode="HTML")
+        await chat.send_voice(voice=fid, caption=text if text.strip() else None, reply_markup=kb)
     else:
-        await chat.send_message(text, reply_markup=kb, parse_mode="HTML")
+        await chat.send_message(text if text.strip() else " ", reply_markup=kb)
 
     kb2 = [
         [InlineKeyboardButton("📤 Enviar ahora", callback_data="PREVIEW_SEND_NOW")],
@@ -372,7 +344,7 @@ async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, intro
     await chat.send_message("¿Qué deseas hacer?", reply_markup=InlineKeyboardMarkup(kb2))
 
 
-# ================ PARSE BOTONES ==================
+# ========= PARSE BOTONES =========
 
 def parse_button_line(line: str) -> Optional[Dict[str, str]]:
     line = line.strip()
@@ -389,7 +361,7 @@ def parse_button_line(line: str) -> Optional[Dict[str, str]]:
     return None
 
 
-# ================ MESSAGE HANDLER ==================
+# ========= MESSAGE HANDLER =========
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if str(update.effective_user.id) != str(ADMIN_ID):
@@ -403,7 +375,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     draft = get_draft(ud)
     defaults = get_default_buttons(ud)
 
-    # -------- PUBLICACIÓN --------
+    # --- PUBLICACIÓN ---
     if state == STATE_WAITING_PUBLICATION:
         if msg.photo:
             draft["type"] = "photo"
@@ -439,7 +411,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ]
             ud[STATE_KEY] = STATE_MAIN_MENU
             return await msg.reply_text(
-                "Publicación recibida.\n\n¿Deseas usar tus botones predeterminados o crear nuevos?",
+                "Publicación recibida.\n\n¿Usar botones predeterminados o crear nuevos?",
                 reply_markup=InlineKeyboardMarkup(kb),
             )
 
@@ -448,13 +420,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Publicación recibida.\n\n"
             "Ahora envía los botones.\n"
             "- Un botón por mensaje, o\n"
-            "- Varios botones en un solo mensaje (uno por línea)\n\n"
+            "- Varios en un solo mensaje (uno por línea)\n\n"
             "Formato: Texto - enlace\n"
             "Escribe *listo* cuando termines.",
             parse_mode="Markdown",
         )
 
-    # -------- BOTONES --------
+    # --- BOTONES ---
     if state == STATE_WAITING_BUTTONS:
         if text_low == "listo":
             if not draft["buttons"]:
@@ -475,7 +447,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         lineas = [l for l in text.splitlines() if l.strip()]
         if not lineas:
             return await msg.reply_text(
-                "Envía botones en formato: Texto - enlace\nUno por línea."
+                "Envía botones en formato: Texto - enlace (uno por línea)."
             )
 
         nuevos: List[Dict[str, str]] = []
@@ -491,11 +463,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if len(nuevos) == 1:
             return await msg.reply_text(
-                "Botón añadido. Puedes enviar más o escribir *listo*.",
+                "Botón añadido. Envía más o escribe *listo*.",
                 parse_mode="Markdown",
             )
 
-        # varios de golpe
         if not defaults:
             kb = [
                 [InlineKeyboardButton("✅ Sí, guardar", callback_data="SAVE_DEFAULT_YES")],
@@ -511,9 +482,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return await send_preview(update, context, f"{len(nuevos)} botones añadidos correctamente:")
 
     if state == STATE_WAITING_SAVE_DEFAULT:
-        return await msg.reply_text("Responde con los botones de la pregunta (Sí, guardar / No guardar).")
+        return await msg.reply_text("Responde usando los botones (Sí, guardar / No guardar).")
 
-    # -------- EDITAR BOTONES --------
+    # --- EDITAR BOTONES ---
     if state == STATE_BUTTON_EDIT_SELECT:
         try:
             idx = int(text.strip())
@@ -557,7 +528,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text(f"Botón eliminado: {eliminado['text']}")
         return await send_preview(update, context, "Vista previa después de eliminar el botón:")
 
-    # -------- PROGRAMAR --------
+    # --- PROGRAMAR ---
     if state == STATE_WAITING_SCHEDULE:
         try:
             dt = datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")
@@ -605,7 +576,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await send_main_menu(update, context)
 
 
-# ================ ENVIAR AHORA ==================
+# ========= ENVIAR AHORA =========
 
 async def send_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ud = context.user_data
@@ -620,15 +591,15 @@ async def send_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = draft["text"] or ""
 
     if t == "photo" and fid:
-        await context.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=fid, caption=text, reply_markup=kb, parse_mode="HTML")
+        await context.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=fid, caption=text if text.strip() else None, reply_markup=kb)
     elif t == "video" and fid:
-        await context.bot.send_video(chat_id=TARGET_CHAT_ID, video=fid, caption=text, reply_markup=kb, parse_mode="HTML")
+        await context.bot.send_video(chat_id=TARGET_CHAT_ID, video=fid, caption=text if text.strip() else None, reply_markup=kb)
     elif t == "audio" and fid:
-        await context.bot.send_audio(chat_id=TARGET_CHAT_ID, audio=fid, caption=text, reply_markup=kb, parse_mode="HTML")
+        await context.bot.send_audio(chat_id=TARGET_CHAT_ID, audio=fid, caption=text if text.strip() else None, reply_markup=kb)
     elif t == "voice" and fid:
-        await context.bot.send_voice(chat_id=TARGET_CHAT_ID, voice=fid, caption=text, reply_markup=kb, parse_mode="HTML")
+        await context.bot.send_voice(chat_id=TARGET_CHAT_ID, voice=fid, caption=text if text.strip() else None, reply_markup=kb)
     else:
-        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=text, reply_markup=kb, parse_mode="HTML")
+        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=text if text.strip() else " ", reply_markup=kb)
 
     job = ud.get(SCHEDULE_JOB_KEY)
     if job is not None:
@@ -640,7 +611,7 @@ async def send_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await send_main_menu(update, context)
 
 
-# ================ JOB PROGRAMADO ==================
+# ========= JOB PROGRAMADO =========
 
 async def scheduled_job_send_post(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
@@ -653,21 +624,24 @@ async def scheduled_job_send_post(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     kb = build_buttons_keyboard(buttons)
 
-    if t == "photo" and fid:
-        await context.bot.send_photo(chat_id=chat_id, photo=fid, caption=text, reply_markup=kb, parse_mode="HTML")
-    elif t == "video" and fid:
-        await context.bot.send_video(chat_id=chat_id, video=fid, caption=text, reply_markup=kb, parse_mode="HTML")
-    elif t == "audio" and fid:
-        await context.bot.send_audio(chat_id=chat_id, audio=fid, caption=text, reply_markup=kb, parse_mode="HTML")
-    elif t == "voice" and fid:
-        await context.bot.send_voice(chat_id=chat_id, voice=fid, caption=text, reply_markup=kb, parse_mode="HTML")
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode="HTML")
+    try:
+        if t == "photo" and fid:
+            await context.bot.send_photo(chat_id=chat_id, photo=fid, caption=text if text.strip() else None, reply_markup=kb)
+        elif t == "video" and fid:
+            await context.bot.send_video(chat_id=chat_id, video=fid, caption=text if text.strip() else None, reply_markup=kb)
+        elif t == "audio" and fid:
+            await context.bot.send_audio(chat_id=chat_id, audio=fid, caption=text if text.strip() else None, reply_markup=kb)
+        elif t == "voice" and fid:
+            await context.bot.send_voice(chat_id=chat_id, voice=fid, caption=text if text.strip() else None, reply_markup=kb)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text if text.strip() else " ", reply_markup=kb)
 
-    await context.bot.send_message(chat_id=admin_id, text="✅ Publicación programada enviada correctamente.")
+        await context.bot.send_message(chat_id=admin_id, text="✅ Publicación programada enviada correctamente.")
+    except Exception as e:
+        await context.bot.send_message(chat_id=admin_id, text=f"⚠ Error al enviar la publicación programada:\n{e}")
 
 
-# ================ MAIN ==================
+# ========= MAIN =========
 
 def main() -> None:
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
