@@ -137,49 +137,15 @@ def get_templates(user_id: int) -> List[Dict[str, str]]:
 
 # --------- Construcción de menús ---------
 def build_main_menu_text(user_id: int) -> str:
-    draft = DRAFTS.get(user_id)
-    defaults = DEFAULTS.get(user_id, {"buttons": [], "templates": []})
+    return "Menú principal:"
 
-    if not draft:
-        resumen = "(Sin publicación)"
-        botones_count = 0
-        prog = "Sin programación"
-    else:
-        text = (draft.get("text") or "").strip()
-        if not text and not draft.get("type"):
-            resumen = "(Sin publicación)"
-        else:
-            resumen = text if len(text) <= 300 else text[:300] + "..."
-            if not resumen:
-                resumen = "(Publicación sin texto)"
-        botones_count = len(draft.get("buttons") or [])
-        if draft.get("scheduled_at"):
-            prog = draft["scheduled_at"].strftime("%Y-%m-%d %H:%M")
-        else:
-            prog = "Sin programación"
-
-    has_templates = bool(defaults.get("templates"))
-    has_default_buttons = bool(defaults.get("buttons"))
-
-    text_menu = (
-        "Borrador actual:\n"
-        "{resumen}\n\n"
-        "Botones en borrador: {botones}\n"
-        "Botones predeterminados: {pred}\n"
-        "Plantillas guardadas: {plantillas}\n"
-        "Programación: {prog}\n"
-    ).format(
-        resumen=resumen,
-        botones=botones_count,
-        pred="Sí" if has_default_buttons else "No",
-        plantillas=len(defaults.get("templates", [])) if has_templates else 0,
-        prog=prog,
-    )
-    return text_menu
 
 
 def build_main_menu_keyboard() -> List[List[InlineKeyboardButton]]:
     keyboard = [
+        [
+            InlineKeyboardButton("📝 Ver borrador actual", callback_data="SHOW_DRAFT")
+        ],
         [
             InlineKeyboardButton("✏️ Crear / cambiar publicación", callback_data="MENU_CREATE"),
             InlineKeyboardButton("🔗 Botones", callback_data="MENU_BUTTONS"),
@@ -197,6 +163,7 @@ def build_main_menu_keyboard() -> List[List[InlineKeyboardButton]]:
         ],
     ]
     return keyboard
+
 
 
 def build_buttons_menu_keyboard() -> List[List[InlineKeyboardButton]]:
@@ -548,7 +515,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="Selecciona una opción:",
+                text=" ",
                 reply_markup=InlineKeyboardMarkup(buttons_after_send),
             )
         await send_main_menu_simple(context, chat_id, user_id)
@@ -1022,7 +989,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
     # --- Edición desde menú Editar ---
-    elif data == "EDIT_TEXT":
+    
+    elif data == "SHOW_DRAFT":
+        await send_draft_preview(user_id, chat_id, context)
+        await send_main_menu_simple(context, chat_id, user_id)
+elif data == "EDIT_TEXT":
         draft = get_draft(user_id)
         if not draft_has_content(draft):
             await context.bot.send_message(
@@ -1567,7 +1538,7 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
         ]
         await context.bot.send_message(
             chat_id=user_id,
-            text="Selecciona una opción:",
+            text=" ",
             reply_markup=InlineKeyboardMarkup(buttons_after_send),
         )
     except Exception as exc:
