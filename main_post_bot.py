@@ -1,7 +1,8 @@
-import os
 import logging
+import os
+import copy
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Dict, Any, Optional, List
 
 from telegram import (
     Update,
@@ -9,786 +10,980 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
-    JobQueue,
     MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 
-# ================= CONFIGURACIÓN BÁSICA =================
+DRAFTS: Dict[int, Dict[str, Any]] = {}
+DEFAULTS: Dict[int, Dict[str, Any]] = {}
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = os.getenv("ADMIN_ID", "")
-# Puede ser id numérico del canal o @username
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "") or ADMIN_ID
-
-if not BOT_TOKEN:
-    raise RuntimeError("Falta la variable de entorno BOT_TOKEN")
-if not ADMIN_ID:
-    raise RuntimeError("Falta la variable de entorno ADMIN_ID")
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ================= CLAVES PARA user_data =================
-
-DRAFT_KEY = "draft"
-STATE_KEY = "state"
-DEFAULT_BUTTONS_KEY = "default_buttons"
-SCHEDULE_JOB_KEY = "schedule_job"
-TEMPLATE_TEXT_KEY = "template_text"
-
-# Estados
-STATE_MAIN_MENU = "MAIN_MENU"
-STATE_WAITING_PUBLICATION = "WAITING_PUBLICATION"
-STATE_WAITING_BUTTONS = "WAITING_BUTTONS"
-STATE_WAITING_SAVE_DEFAULT = "WAITING_SAVE_DEFAULT"
-STATE_BUTTON_EDIT_SELECT = "BUTTON_EDIT_SELECT"
-STATE_BUTTON_EDIT_TEXT = "BUTTON_EDIT_TEXT"
-STATE_BUTTON_EDIT_URL = "BUTTON_EDIT_URL"
-STATE_BUTTON_DELETE_SELECT = "BUTTON_DELETE_SELECT"
-STATE_WAITING_SCHEDULE = "WAITING_SCHEDULE"
+ADMIN_ID: int = 0
+TARGET_CHAT_ID: Any = None
 
 
-# ================= FUNCIONES AUXILIARES =================
-
-def get_draft(ud: Dict[str, Any]) -> Dict[str, Any]:
-    """Obtiene / inicializa el borrador actual."""
-    if DRAFT_KEY not in ud:
-        ud[DRAFT_KEY] = {
-            "type": None,          # photo, video, audio, voice, text
+def init_user_structs(user_id: int) -> None:
+    if user_id not in DRAFTS:
+        DRAFTS[user_id] = {
+            "type": None,
             "file_id": None,
-            "text": None,
-            "buttons": [],         # lista de dicts {"text","url"}
-            "scheduled_at": None,  # datetime
+            "text": "",
+            "buttons": [],
+            "scheduled_at": None,
+            "job": None,
         }
-    return ud[DRAFT_KEY]
+    if user_id not in DEFAULTS:
+        DEFAULTS[user_id] = {
+            "buttons": [],
+            "template_text": "",
+        }
 
 
-def get_default_buttons(ud: Dict[str, Any]) -> List[Dict[str, str]]:
-    if DEFAULT_BUTTONS_KEY not in ud:
-        ud[DEFAULT_BUTTONS_KEY] = []
-    return ud[DEFAULT_BUTTONS_KEY]
+def draft_has_content(draft: Dict[str, Any]) -> bool:
+    if draft is None:
+        return False
+    if draft.get("type"):
+        return True
+    text = draft.get("text") or ""
+    return text.strip() != ""
 
 
-def build_buttons_keyboard(buttons: List[Dict[str, str]]) -> Optional[InlineKeyboardMarkup]:
-    """Crea teclado en lista vertical (un botón por fila)."""
-    if not buttons:
-        return None
-    rows = [[InlineKeyboardButton(b["text"], url=b["url"])] for b in buttons]
-    return InlineKeyboardMarkup(rows)
+def build_main_menu_text(user_id: int) -> str:
+    draft = DRAFTS.get(user_id)
+    defaults = DEFAULTS.get(user_id, {"buttons": [], "template_text": ""})
+
+    if not draft:
+        resumen = "(Sin publicación)"
+        botones_count = 0
+        prog = "Sin programación"
+    else:
+        text = draft.get("text") or ""
+        text = text.strip()
+        if not text and not draft.get("type"):
+            resumen = "(Sin publicación)"
+        else:
+            if len(text) > 300:
+                resumen = text[:300] + "..."
+            else:
+                resumen = text if text else "(Publicación sin texto)"
+        botones_count = len(draft.get("buttons") or [])
+        if draft.get("scheduled_at"):
+            prog = draft["scheduled_at"].strftime("%Y-%m-%d %H:%M")
+        else:
+            prog = "Sin programación"
+
+    has_default_buttons = bool(defaults.get("buttons"))
+    has_template = bool((defaults.get("template_text") or "").strip())
+
+    text_menu = (
+        "📌 BOT AVANZADO – OPCIÓN A\n\n"
+        "Borrador actual:\n"
+        "{resumen}\n\n"
+        "Botones: {botones}\n"
+        "Botones predeterminados: {pred}\n"
+        "Plantilla recurrente: {plantilla}\n"
+        "Programación: {prog}\n"
+    ).format(
+        resumen=resumen,
+        botones=botones_count,
+        pred="Sí" if has_default_buttons else "No",
+        plantilla="Sí" if has_template else "No",
+        prog=prog,
+    )
+    return text_menu
 
 
-def invisible_text() -> str:
-    """Caracter invisible aceptado por Telegram como texto no vacío."""
-    return "\u2063"
+def build_main_menu_keyboard() -> List[List[InlineKeyboardButton]]:
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ Crear / cambiar publicación", callback_data="MENU_CREATE"),
+            InlineKeyboardButton("🔗 Botones", callback_data="MENU_BUTTONS"),
+        ],
+        [
+            InlineKeyboardButton("⏰ Programar", callback_data="MENU_SCHEDULE"),
+            InlineKeyboardButton("📤 Enviar ahora", callback_data="MENU_SEND_NOW"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Editar publicación", callback_data="MENU_EDIT"),
+            InlineKeyboardButton("📄 Plantillas", callback_data="MENU_TEMPLATES"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancelar borrador", callback_data="MENU_CANCEL_DRAFT"),
+        ],
+    ]
+    return keyboard
 
 
-# ================= MENÚ PRINCIPAL =================
-
-async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ud = context.user_data
-    draft = get_draft(ud)
-    defaults = get_default_buttons(ud)
-
-    ud[STATE_KEY] = STATE_MAIN_MENU
-
-    resumen_texto = draft["text"] or "(Sin publicación)"
-    if len(resumen_texto) > 250:
-        resumen_texto = resumen_texto[:247] + "..."
-
-    num_botones = len(draft["buttons"])
-    hay_predeterminados = "Sí" if defaults else "No"
-    hay_plantilla = "Sí" if ud.get(TEMPLATE_TEXT_KEY) else "No"
-    prog = draft["scheduled_at"].strftime("%Y-%m-%d %H:%M") if draft["scheduled_at"] else "Sin programación"
-
-    msg = (
-        "📌 *BOT AVANZADO – OPCIÓN A*\n\n"
-        f"*Borrador actual:*\n{resumen_texto}\n\n"
-        f"*Botones:* {num_botones}\n"
-        f"*Botones predeterminados:* {hay_predeterminados}\n"
-        f"*Plantilla recurrente:* {hay_plantilla}\n"
-        f"*Programación:* {prog}"
+async def send_main_menu_simple(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
+) -> None:
+    text_menu = build_main_menu_text(user_id)
+    keyboard = build_main_menu_keyboard()
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text_menu,
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-    kb = [
-        [InlineKeyboardButton("📝 Crear publicación", callback_data="CREATE_PUBLICATION")],
-        [InlineKeyboardButton("✏️ Editar publicación", callback_data="EDIT_PUBLICATION")],
-        [InlineKeyboardButton("🔗 Botones", callback_data="MENU_BUTTONS")],
-        [InlineKeyboardButton("🌟 Plantilla recurrente", callback_data="MENU_TEMPLATE")],
-        [InlineKeyboardButton("⏰ Programar envío", callback_data="MENU_SCHEDULE")],
-        [InlineKeyboardButton("📤 Enviar ahora", callback_data="MENU_SEND_NOW")],
-    ]
-    markup = InlineKeyboardMarkup(kb)
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            msg, parse_mode="Markdown", reply_markup=markup
+def is_admin_private(update: Update) -> bool:
+    if update.effective_user is None or update.effective_chat is None:
+        return False
+
+    user_id = update.effective_user.id
+    chat = update.effective_chat
+
+    if chat.type != "private" or user_id != ADMIN_ID:
+        try:
+            text = "Bot privado. No tienes permiso para usar este bot."
+            if update.message:
+                update.message.reply_text(text)  # type: ignore[union-attr]
+            elif update.callback_query:
+                update.callback_query.answer(text, show_alert=True)  # type: ignore[union-attr]
+            else:
+                chat.send_message(text=text)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def get_draft(user_id: int) -> Dict[str, Any]:
+    init_user_structs(user_id)
+    return DRAFTS[user_id]
+
+
+def get_defaults(user_id: int) -> Dict[str, Any]:
+    init_user_structs(user_id)
+    return DEFAULTS[user_id]
+
+
+async def send_draft_preview(
+    user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    draft = get_draft(user_id)
+    if not draft_has_content(draft):
+        await context.bot.send_message(chat_id=chat_id, text="(Sin publicación para vista previa)")
+        return
+
+    buttons = draft.get("buttons") or []
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+    text = draft.get("text") or ""
+    content_type = draft.get("type")
+    file_id = draft.get("file_id")
+
+    if content_type == "photo" and file_id:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=file_id,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+    elif content_type == "video" and file_id:
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=file_id,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+    elif content_type == "voice" and file_id:
+        await context.bot.send_voice(
+            chat_id=chat_id,
+            voice=file_id,
+            caption=text,
+            reply_markup=reply_markup,
         )
     else:
-        await update.effective_chat.send_message(
-            msg, parse_mode="Markdown", reply_markup=markup
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text if text else "(Publicación sin texto)",
+            reply_markup=reply_markup,
         )
 
 
-# ================= /START =================
+async def send_publication_to_target(
+    draft: Dict[str, Any],
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not draft_has_content(draft):
+        return
+
+    buttons = draft.get("buttons") or []
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+    text = draft.get("text") or ""
+    content_type = draft.get("type")
+    file_id = draft.get("file_id")
+
+    if content_type == "photo" and file_id:
+        await context.bot.send_photo(
+            chat_id=TARGET_CHAT_ID,
+            photo=file_id,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+    elif content_type == "video" and file_id:
+        await context.bot.send_video(
+            chat_id=TARGET_CHAT_ID,
+            video=file_id,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+    elif content_type == "voice" and file_id:
+        await context.bot.send_voice(
+            chat_id=TARGET_CHAT_ID,
+            voice=file_id,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=TARGET_CHAT_ID,
+            text=text if text else "(Publicación sin texto)",
+            reply_markup=reply_markup,
+        )
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if str(update.effective_user.id) != str(ADMIN_ID):
-        return await update.message.reply_text("Este bot es privado.")
+    if not is_admin_private(update):
+        return
 
-    get_draft(context.user_data)
-    get_default_buttons(context.user_data)
-    await send_main_menu(update, context)
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+    init_user_structs(user_id)
+    context.user_data.clear()
+    await send_main_menu_simple(context, chat_id, user_id)
 
 
-# ================= CALLBACK QUERY (MENÚ) =================
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if query is None:
+        return
     await query.answer()
-    data = query.data
 
-    if str(query.from_user.id) != str(ADMIN_ID):
-        return await query.edit_message_text("No tienes permisos para usar este bot.")
+    if not is_admin_private(update):
+        return
 
-    ud = context.user_data
-    draft = get_draft(ud)
-    defaults = get_default_buttons(ud)
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
 
-    # Volver al menú
-    if data == "BACK_MAIN":
-        return await send_main_menu(update, context)
+    init_user_structs(user_id)
+    data = query.data or ""
 
-    # Crear publicación nueva
-    if data == "CREATE_PUBLICATION":
-        ud[DRAFT_KEY] = {
-            "type": None,
-            "file_id": None,
-            "text": None,
-            "buttons": [],
-            "scheduled_at": None,
-        }
-        ud[STATE_KEY] = STATE_WAITING_PUBLICATION
-        return await query.edit_message_text(
-            "Envía tu publicación como mensaje normal:\n\n"
-            "- Puede ser: foto, video, audio o nota de voz con texto, o solo texto.\n"
-            "- Lo que envíes será el borrador actual."
+    if data == "MENU_CREATE":
+        context.user_data["state"] = "AWAITING_NEW_PUBLICATION_MESSAGE"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Envía ahora la publicación como si fueras a enviarla al canal "
+                "(puede ser foto+texto, video+texto, nota de voz o solo texto)."
+            ),
         )
 
-    # Editar publicación existente
-    if data == "EDIT_PUBLICATION":
-        if not draft["text"] and not draft["file_id"]:
-            await query.edit_message_text("No hay publicación en borrador para editar.")
-            return await send_main_menu(update, context)
-        kb = [
-            [InlineKeyboardButton("✏️ Editar texto / multimedia", callback_data="EDIT_TEXT")],
-            [InlineKeyboardButton("🔗 Editar botones", callback_data="MENU_BUTTONS")],
-            [InlineKeyboardButton("⬅️ Volver", callback_data="BACK_MAIN")],
-        ]
-        return await query.edit_message_text(
-            "¿Qué parte de la publicación deseas editar?",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-
-    if data == "EDIT_TEXT":
-        ud[STATE_KEY] = STATE_WAITING_PUBLICATION
-        return await query.edit_message_text(
-            "Envía la nueva publicación (texto + multimedia). "
-            "Reemplazará completamente al borrador actual."
-        )
-
-    # Submenú de botones
-    if data == "MENU_BUTTONS":
-        ud[STATE_KEY] = "BTN_MENU"
-        if draft["buttons"]:
-            lista = "\n".join(
-                f"{i+1}. {b['text']} → {b['url']}" for i, b in enumerate(draft["buttons"])
+    elif data == "MENU_BUTTONS":
+        defaults = get_defaults(user_id)
+        if defaults.get("buttons"):
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🟢 Usar botones predeterminados",
+                        callback_data="BUTTONS_USE_DEFAULT",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️ Crear nuevos botones",
+                        callback_data="BUTTONS_CREATE_NEW",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Volver al menú",
+                        callback_data="BACK_TO_MENU",
+                    )
+                ],
+            ]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Elige una opción para los botones:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
         else:
-            lista = "Sin botones."
+            context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
+            context.user_data["buttons_mode"] = "CREATE"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Envía todos los botones en un solo mensaje, uno por línea, "
+                    'con el formato "Texto del botón - URL".'
+                ),
+            )
 
-        kb = [
-            [InlineKeyboardButton("➕ Añadir botón", callback_data="BTN_ADD")],
-            [InlineKeyboardButton("✏️ Editar botón", callback_data="BTN_EDIT")],
-            [InlineKeyboardButton("❌ Eliminar botón", callback_data="BTN_DELETE")],
-            [InlineKeyboardButton("⭐ Guardar como predeterminados", callback_data="BTN_SAVE_DEFAULT")],
-            [InlineKeyboardButton("⬅️ Volver", callback_data="BACK_MAIN")],
-        ]
-        return await query.edit_message_text(
-            f"*Botones actuales:*\n{lista}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-
-    if data == "BTN_ADD":
-        ud[STATE_KEY] = STATE_WAITING_BUTTONS
-        return await query.edit_message_text(
-            "Envía los botones así:\n\n"
-            "- Puedes enviar varios en UN solo mensaje (uno por línea),\n"
-            "- o un botón por mensaje.\n\n"
-            "Formato: Texto - enlace\n\n"
-            "Cuando termines, escribe *listo*.",
-            parse_mode="Markdown",
-        )
-
-    if data == "BTN_EDIT":
-        if not draft["buttons"]:
-            await query.edit_message_text("No hay botones para editar.")
-            return await send_main_menu(update, context)
-        ud[STATE_KEY] = STATE_BUTTON_EDIT_SELECT
-        lista = "\n".join(
-            f"{i+1}. {b['text']} → {b['url']}" for i, b in enumerate(draft["buttons"])
-        )
-        return await query.edit_message_text(
-            f"¿Qué botón quieres editar? (envía el número)\n\n{lista}"
-        )
-
-    if data == "BTN_DELETE":
-        if not draft["buttons"]:
-            await query.edit_message_text("No hay botones para eliminar.")
-            return await send_main_menu(update, context)
-        ud[STATE_KEY] = STATE_BUTTON_DELETE_SELECT
-        lista = "\n".join(
-            f"{i+1}. {b['text']} → {b['url']}" for i, b in enumerate(draft["buttons"])
-        )
-        return await query.edit_message_text(
-            f"¿Qué botón quieres eliminar? (envía el número)\n\n{lista}"
-        )
-
-    if data == "BTN_SAVE_DEFAULT":
-        if not draft["buttons"]:
-            await query.edit_message_text("No hay botones en el borrador para guardar.")
-            return await send_main_menu(update, context)
-        ud[DEFAULT_BUTTONS_KEY] = list(draft["buttons"])
-        await query.edit_message_text("✅ Botones guardados como predeterminados.")
-        return await send_main_menu(update, context)
-
-    # Plantilla recurrente
-    if data == "MENU_TEMPLATE":
-        tpl = ud.get(TEMPLATE_TEXT_KEY) or "(Sin plantilla guardada)"
-        kb = [
-            [InlineKeyboardButton("💾 Guardar plantilla", callback_data="TPL_SAVE")],
-            [InlineKeyboardButton("📥 Insertar plantilla", callback_data="TPL_INSERT")],
-            [InlineKeyboardButton("🗑️ Borrar plantilla", callback_data="TPL_CLEAR")],
-            [InlineKeyboardButton("⬅️ Volver", callback_data="BACK_MAIN")],
-        ]
-        return await query.edit_message_text(
-            f"*Plantilla actual:*\n{tpl}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-
-    if data == "TPL_SAVE":
-        if not draft["text"]:
-            await query.edit_message_text("No hay texto en el borrador para guardar.")
+    elif data == "BUTTONS_USE_DEFAULT":
+        defaults = get_defaults(user_id)
+        draft = get_draft(user_id)
+        if not defaults.get("buttons"):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay botones predeterminados guardados.",
+            )
         else:
-            ud[TEMPLATE_TEXT_KEY] = draft["text"]
-            await query.edit_message_text("✅ Plantilla guardada.")
-        return await send_main_menu(update, context)
+            draft["buttons"] = copy.deepcopy(defaults["buttons"])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Botones predeterminados aplicados al borrador.",
+            )
+            await send_draft_preview(user_id, chat_id, context)
+        await send_main_menu_simple(context, chat_id, user_id)
 
-    if data == "TPL_INSERT":
-        tpl = ud.get(TEMPLATE_TEXT_KEY)
-        if not tpl:
-            await query.edit_message_text("No hay plantilla guardada.")
-            return await send_main_menu(update, context)
-        draft["text"] = tpl
-        await query.edit_message_text("📌 Plantilla insertada en el borrador.")
-        return await send_preview(update, context)
-
-    if data == "TPL_CLEAR":
-        ud[TEMPLATE_TEXT_KEY] = None
-        await query.edit_message_text("🗑️ Plantilla borrada.")
-        return await send_main_menu(update, context)
-
-    # Programación
-    if data == "MENU_SCHEDULE":
-        ud[STATE_KEY] = STATE_WAITING_SCHEDULE
-        return await query.edit_message_text(
-            "Indica fecha y hora para programar.\nFormato: AAAA-MM-DD HH:MM"
+    elif data == "BUTTONS_CREATE_NEW":
+        context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
+        context.user_data["buttons_mode"] = "CREATE"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Envía todos los botones en un solo mensaje, uno por línea, "
+                'con el formato "Texto del botón - URL".'
+            ),
         )
 
-    if data == "MENU_SEND_NOW":
-        return await send_post_now(update, context)
-
-    if data == "PREVIEW_SEND_NOW":
-        return await send_post_now(update, context)
-
-    if data == "PREVIEW_SCHEDULE":
-        ud[STATE_KEY] = STATE_WAITING_SCHEDULE
-        return await query.edit_message_text(
-            "Indica fecha y hora para programar.\nFormato: AAAA-MM-DD HH:MM"
+    elif data == "SAVE_BUTTONS_YES":
+        draft = get_draft(user_id)
+        defaults = get_defaults(user_id)
+        defaults["buttons"] = copy.deepcopy(draft.get("buttons") or [])
+        context.user_data["state"] = None
+        context.user_data.pop("buttons_mode", None)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Botones guardados como predeterminados.",
         )
+        await send_draft_preview(user_id, chat_id, context)
+        await send_main_menu_simple(context, chat_id, user_id)
 
-    if data == "PREVIEW_EDIT":
-        kb = [
-            [InlineKeyboardButton("✏️ Editar texto / multimedia", callback_data="EDIT_TEXT")],
-            [InlineKeyboardButton("🔗 Editar botones", callback_data="MENU_BUTTONS")],
-            [InlineKeyboardButton("⬅️ Volver", callback_data="BACK_MAIN")],
+    elif data == "SAVE_BUTTONS_NO":
+        context.user_data["state"] = None
+        context.user_data.pop("buttons_mode", None)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Botones usados solo en este borrador.",
+        )
+        await send_draft_preview(user_id, chat_id, context)
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    elif data == "MENU_SCHEDULE":
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador actual para programar.",
+            )
+        else:
+            context.user_data["state"] = "AWAITING_SCHEDULE_DATETIME"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Introduce la fecha y hora en formato AAAA-MM-DD HH:MM\n"
+                    "Ejemplo: 2025-12-31 18:30"
+                ),
+            )
+
+    elif data == "MENU_SEND_NOW":
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador actual para enviar.",
+            )
+        else:
+            if draft.get("job") is not None:
+                try:
+                    draft["job"].schedule_removal()
+                except Exception:
+                    pass
+                draft["job"] = None
+                draft["scheduled_at"] = None
+
+            await send_publication_to_target(draft, context)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="✅ Publicación enviada al canal.",
+            )
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    elif data == "MENU_EDIT":
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador para editar.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "✏️ Editar texto",
+                        callback_data="EDIT_TEXT",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔗 Editar botones",
+                        callback_data="EDIT_BUTTONS",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🖼 Cambiar media",
+                        callback_data="EDIT_MEDIA",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Volver al menú",
+                        callback_data="BACK_TO_MENU",
+                    )
+                ],
+            ]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Elige qué parte de la publicación quieres editar:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
+    elif data == "EDIT_TEXT":
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador para editar el texto.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            context.user_data["state"] = "AWAITING_EDIT_TEXT"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Envía ahora el nuevo texto de la publicación.",
+            )
+
+    elif data == "EDIT_BUTTONS":
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador para editar los botones.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            context.user_data["state"] = "AWAITING_EDIT_BUTTONS_TEXT"
+            context.user_data["buttons_mode"] = "EDIT"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Envía todos los botones en un solo mensaje, uno por línea, "
+                    'con el formato "Texto del botón - URL".'
+                ),
+            )
+
+    elif data == "EDIT_MEDIA":
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador para cambiar la media.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            context.user_data["state"] = "AWAITING_NEW_MEDIA"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Envía ahora la nueva media (foto, video o nota de voz). "
+                    "Si no envías texto, se conservará el texto actual."
+                ),
+            )
+
+    elif data == "MENU_TEMPLATES":
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "💾 Guardar borrador como plantilla",
+                    callback_data="TEMPLATE_SAVE",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📥 Insertar plantilla en borrador",
+                    callback_data="TEMPLATE_INSERT",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Volver al menú",
+                    callback_data="BACK_TO_MENU",
+                )
+            ],
         ]
-        return await query.edit_message_text(
-            "¿Qué deseas editar?",
-            reply_markup=InlineKeyboardMarkup(kb),
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Opciones de plantillas:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
-    if data == "PREVIEW_CANCEL":
-        ud[DRAFT_KEY] = {
+    elif data == "TEMPLATE_SAVE":
+        draft = get_draft(user_id)
+        if not draft.get("text"):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay texto en el borrador para guardar como plantilla.",
+            )
+        else:
+            defaults = get_defaults(user_id)
+            defaults["template_text"] = draft["text"]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Plantilla guardada correctamente.",
+            )
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    elif data == "TEMPLATE_INSERT":
+        defaults = get_defaults(user_id)
+        template_text = defaults.get("template_text") or ""
+        if not template_text.strip():
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay plantilla guardada para insertar.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            draft = get_draft(user_id)
+            existing_text = draft.get("text") or ""
+            if not draft_has_content(draft):
+                draft["type"] = "text"
+                draft["file_id"] = None
+                draft["text"] = template_text
+            else:
+                if existing_text.strip():
+                    draft["text"] = existing_text + "\n\n" + template_text
+                else:
+                    draft["text"] = template_text
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Plantilla insertada en el borrador.",
+            )
+            await send_draft_preview(user_id, chat_id, context)
+            await send_main_menu_simple(context, chat_id, user_id)
+
+    elif data == "MENU_CANCEL_DRAFT":
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "Sí, cancelar borrador",
+                    callback_data="CONFIRM_CANCEL_DRAFT",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Volver al menú",
+                    callback_data="BACK_TO_MENU",
+                )
+            ],
+        ]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="¿Seguro que quieres cancelar y borrar el borrador actual?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data == "CONFIRM_CANCEL_DRAFT":
+        draft = get_draft(user_id)
+        if draft.get("job") is not None:
+            try:
+                draft["job"].schedule_removal()
+            except Exception:
+                pass
+        DRAFTS[user_id] = {
             "type": None,
             "file_id": None,
-            "text": None,
+            "text": "",
             "buttons": [],
             "scheduled_at": None,
+            "job": None,
         }
-        await query.edit_message_text("❌ Borrador cancelado.")
-        return await send_main_menu(update, context)
-
-    if data == "SAVE_DEFAULT_YES":
-        ud[DEFAULT_BUTTONS_KEY] = list(draft["buttons"])
-        await query.edit_message_text("✅ Botones guardados como predeterminados.")
-        return await send_preview(update, context)
-
-    if data == "SAVE_DEFAULT_NO":
-        await query.edit_message_text("Botones NO guardados como predeterminados.")
-        return await send_preview(update, context)
-
-    if data == "USE_DEFAULT_BTNS":
-        draft["buttons"] = list(defaults)
-        await query.edit_message_text("Botones predeterminados aplicados al borrador.")
-        return await send_preview(update, context)
-
-    if data == "CREATE_NEW_BTNS":
-        ud[STATE_KEY] = STATE_WAITING_BUTTONS
-        return await query.edit_message_text(
-            "Envía los nuevos botones.\nFormato: Texto - enlace\n"
-            "Puedes enviar varios en un solo mensaje (uno por línea).",
-            parse_mode="Markdown",
+        context.user_data.clear()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Borrador cancelado.",
         )
+        await send_main_menu_simple(context, chat_id, user_id)
 
+    elif data == "BACK_TO_MENU":
+        context.user_data["state"] = None
+        context.user_data.pop("buttons_mode", None)
+        await send_main_menu_simple(context, chat_id, user_id)
 
-# ================= VISTA PREVIA =================
-
-async def send_preview(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    intro: str = "📎 Vista previa de la publicación:"
-) -> None:
-    chat = update.effective_chat
-    ud = context.user_data
-    draft = get_draft(ud)
-
-    await chat.send_message(intro)
-
-    kb = build_buttons_keyboard(draft["buttons"])
-    t = draft["type"]
-    fid = draft["file_id"]
-    text = draft["text"] or ""
-
-    caption = text.strip() if text.strip() else None
-    safe_text = text.strip() if text.strip() else invisible_text()
-
-    if t == "photo" and fid:
-        await chat.send_photo(photo=fid, caption=caption, reply_markup=kb)
-    elif t == "video" and fid:
-        await chat.send_video(video=fid, caption=caption, reply_markup=kb)
-    elif t == "audio" and fid:
-        await chat.send_audio(audio=fid, caption=caption, reply_markup=kb)
-    elif t == "voice" and fid:
-        await chat.send_voice(voice=fid, caption=caption, reply_markup=kb)
     else:
-        await chat.send_message(safe_text, reply_markup=kb)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Opción no reconocida.",
+        )
+        await send_main_menu_simple(context, chat_id, user_id)
 
-    kb2 = [
-        [InlineKeyboardButton("📤 Enviar ahora", callback_data="PREVIEW_SEND_NOW")],
-        [InlineKeyboardButton("⏰ Programar", callback_data="PREVIEW_SCHEDULE")],
-        [InlineKeyboardButton("✏️ Editar publicación", callback_data="PREVIEW_EDIT")],
-        [InlineKeyboardButton("❌ Cancelar borrador", callback_data="PREVIEW_CANCEL")],
-        [InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_MAIN")],
+
+def parse_buttons_from_text(text: str) -> List[List[InlineKeyboardButton]]:
+    lines = (text or "").splitlines()
+    rows: List[List[InlineKeyboardButton]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if "-" not in line:
+            continue
+        parts = line.split("-", 1)
+        label = parts[0].strip()
+        url = parts[1].strip()
+        if not label or not url:
+            continue
+        button = InlineKeyboardButton(label, url=url)
+        rows.append([button])
+    return rows
+
+
+async def handle_new_publication_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if message is None:
+        return
+
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    draft = get_draft(user_id)
+
+    content_type: Optional[str] = None
+    file_id: Optional[str] = None
+    text: str = ""
+
+    if message.photo:
+        content_type = "photo"
+        file_id = message.photo[-1].file_id
+        text = message.caption or ""
+    elif message.video:
+        content_type = "video"
+        file_id = message.video.file_id
+        text = message.caption or ""
+    elif message.voice:
+        content_type = "voice"
+        file_id = message.voice.file_id
+        text = message.caption or ""
+    elif message.text:
+        content_type = "text"
+        file_id = None
+        text = message.text
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Tipo de mensaje no soportado. Envía foto, video, nota de voz o texto.",
+        )
+        return
+
+    draft["type"] = content_type
+    draft["file_id"] = file_id
+    draft["text"] = text
+
+    context.user_data["state"] = None
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Publicación guardada en el borrador.",
+    )
+    await send_draft_preview(user_id, chat_id, context)
+    await send_main_menu_simple(context, chat_id, user_id)
+
+
+async def handle_new_buttons_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if message is None:
+        return
+
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    draft = get_draft(user_id)
+
+    text = message.text or ""
+    rows = parse_buttons_from_text(text)
+    if not rows:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="No se encontraron botones válidos. Revisa el formato.",
+        )
+        return
+
+    draft["buttons"] = rows
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Botones actualizados en el borrador.",
+    )
+    await send_draft_preview(user_id, chat_id, context)
+
+    context.user_data["state"] = "AWAITING_SAVE_DEFAULT_BUTTONS_CHOICE"
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "Sí, guardar como predeterminados",
+                callback_data="SAVE_BUTTONS_YES",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "No, solo usar en este borrador",
+                callback_data="SAVE_BUTTONS_NO",
+            )
+        ],
     ]
-    await chat.send_message(
-        "¿Qué deseas hacer con esta publicación?",
-        reply_markup=InlineKeyboardMarkup(kb2),
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="¿Quieres guardar estos botones como predeterminados?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-# ================= PARSEO DE BOTONES =================
-
-def parse_button_line(line: str) -> Optional[Dict[str, str]]:
-    line = line.strip()
-    if not line:
-        return None
-    separators = [" - ", " – ", " — ", " | "]
-    for sep in separators:
-        if sep in line:
-            text, url = line.split(sep, 1)
-            text = text.strip()
-            url = url.strip()
-            if text and url:
-                return {"text": text, "url": url}
-    return None
-
-
-# ================= MANEJADOR DE MENSAJES =================
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if str(update.effective_user.id) != str(ADMIN_ID):
+async def handle_schedule_datetime(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if message is None or not message.text:
         return
 
-    msg = update.message
-    text = msg.text or ""
-    text_lower = text.lower().strip()
-
-    ud = context.user_data
-    state = ud.get(STATE_KEY, STATE_MAIN_MENU)
-    draft = get_draft(ud)
-    defaults = get_default_buttons(ud)
-
-    # ----- PUBLICACIÓN -----
-    if state == STATE_WAITING_PUBLICATION:
-        if msg.photo:
-            draft["type"] = "photo"
-            draft["file_id"] = msg.photo[-1].file_id
-            draft["text"] = msg.caption or ""
-        elif msg.video:
-            draft["type"] = "video"
-            draft["file_id"] = msg.video.file_id
-            draft["text"] = msg.caption or ""
-        elif msg.audio:
-            draft["type"] = "audio"
-            draft["file_id"] = msg.audio.file_id
-            draft["text"] = msg.caption or ""
-        elif msg.voice:
-            draft["type"] = "voice"
-            draft["file_id"] = msg.voice.file_id
-            draft["text"] = msg.caption or ""
-        else:
-            draft["type"] = "text"
-            draft["file_id"] = None
-            draft["text"] = text
-
-        if not draft["text"] and not draft["file_id"]:
-            return await msg.reply_text("Envía texto o multimedia con texto.")
-
-        draft["buttons"] = []
-        draft["scheduled_at"] = None
-
-        if defaults:
-            kb = [
-                [InlineKeyboardButton("✅ Usar botones predeterminados", callback_data="USE_DEFAULT_BTNS")],
-                [InlineKeyboardButton("➕ Crear nuevos botones", callback_data="CREATE_NEW_BTNS")],
-            ]
-            ud[STATE_KEY] = STATE_MAIN_MENU
-            return await msg.reply_text(
-                "Publicación recibida.\n¿Quieres usar los botones predeterminados o crear nuevos?",
-                reply_markup=InlineKeyboardMarkup(kb),
-            )
-
-        ud[STATE_KEY] = STATE_WAITING_BUTTONS
-        return await msg.reply_text(
-            "Publicación recibida.\n\n"
-            "Ahora envía los botones:\n"
-            "- Un botón por mensaje, o\n"
-            "- Varios botones en un mensaje (uno por línea).\n\n"
-            "Formato: Texto - enlace\n\n"
-            "Escribe *listo* cuando termines.",
-            parse_mode="Markdown",
-        )
-
-    # ----- BOTONES -----
-    if state == STATE_WAITING_BUTTONS:
-        if text_lower == "listo":
-            if not draft["buttons"]:
-                return await msg.reply_text("Todavía no has añadido botones.")
-            if not defaults:
-                kb = [
-                    [InlineKeyboardButton("✅ Sí, guardar", callback_data="SAVE_DEFAULT_YES")],
-                    [InlineKeyboardButton("❌ No guardar", callback_data="SAVE_DEFAULT_NO")],
-                ]
-                ud[STATE_KEY] = STATE_WAITING_SAVE_DEFAULT
-                return await msg.reply_text(
-                    "¿Quieres guardar estos botones como predeterminados?",
-                    reply_markup=InlineKeyboardMarkup(kb),
-                )
-            ud[STATE_KEY] = STATE_MAIN_MENU
-            return await send_preview(update, context)
-
-        lines = [l for l in text.splitlines() if l.strip()]
-        if not lines:
-            return await msg.reply_text(
-                "Envía los botones en formato: Texto - enlace (uno por línea)."
-            )
-
-        nuevos: List[Dict[str, str]] = []
-        for i, line in enumerate(lines, start=1):
-            b = parse_button_line(line)
-            if not b:
-                return await msg.reply_text(
-                    f"Línea {i} inválida:\n{line}\n\n"
-                    "Formato correcto: Texto - enlace"
-                )
-            nuevos.append(b)
-
-        draft["buttons"].extend(nuevos)
-
-        if len(nuevos) == 1:
-            return await msg.reply_text(
-                "Botón añadido. Puedes enviar más o escribir *listo*.",
-                parse_mode="Markdown",
-            )
-
-        if not defaults:
-            kb = [
-                [InlineKeyboardButton("✅ Sí, guardar", callback_data="SAVE_DEFAULT_YES")],
-                [InlineKeyboardButton("❌ No guardar", callback_data="SAVE_DEFAULT_NO")],
-            ]
-            ud[STATE_KEY] = STATE_WAITING_SAVE_DEFAULT
-            return await msg.reply_text(
-                f"{len(nuevos)} botones añadidos.\n¿Guardarlos como predeterminados?",
-                reply_markup=InlineKeyboardMarkup(kb),
-            )
-
-        ud[STATE_KEY] = STATE_MAIN_MENU
-        return await send_preview(update, context, f"{len(nuevos)} botones añadidos correctamente:")
-
-    if state == STATE_WAITING_SAVE_DEFAULT:
-        return await msg.reply_text(
-            "Responde usando los botones (Sí, guardar / No guardar)."
-        )
-
-    # ----- EDITAR BOTONES -----
-    if state == STATE_BUTTON_EDIT_SELECT:
-        try:
-            idx = int(text.strip())
-        except ValueError:
-            return await msg.reply_text("Envía un número válido.")
-        if idx < 1 or idx > len(draft["buttons"]):
-            return await msg.reply_text("Número fuera de rango.")
-        ud["edit_index"] = idx - 1
-        ud[STATE_KEY] = STATE_BUTTON_EDIT_TEXT
-        return await msg.reply_text("Escribe el nuevo texto del botón.")
-
-    if state == STATE_BUTTON_EDIT_TEXT:
-        idx = ud.get("edit_index")
-        if idx is None or idx < 0 or idx >= len(draft["buttons"]):
-            ud[STATE_KEY] = STATE_MAIN_MENU
-            return await msg.reply_text("Error interno con el índice del botón.")
-        draft["buttons"][idx]["text"] = text.strip()
-        ud[STATE_KEY] = STATE_BUTTON_EDIT_URL
-        return await msg.reply_text("Ahora escribe el nuevo enlace del botón.")
-
-    if state == STATE_BUTTON_EDIT_URL:
-        idx = ud.get("edit_index")
-        if idx is None or idx < 0 or idx >= len(draft["buttons"]):
-            ud[STATE_KEY] = STATE_MAIN_MENU
-            return await msg.reply_text("Error interno con el índice del botón.")
-        draft["buttons"][idx]["url"] = text.strip()
-        ud["edit_index"] = None
-        ud[STATE_KEY] = STATE_MAIN_MENU
-        await msg.reply_text("✅ Botón actualizado.")
-        return await send_preview(update, context, "Vista previa después de editar el botón:")
-
-    if state == STATE_BUTTON_DELETE_SELECT:
-        try:
-            idx = int(text.strip())
-        except ValueError:
-            return await msg.reply_text("Envía un número válido.")
-        if idx < 1 or idx > len(draft["buttons"]):
-            return await msg.reply_text("Número fuera de rango.")
-        eliminado = draft["buttons"].pop(idx - 1)
-        ud[STATE_KEY] = STATE_MAIN_MENU
-        await msg.reply_text(f"Botón eliminado: {eliminado['text']}")
-        return await send_preview(update, context, "Vista previa después de eliminar el botón:")
-
-    # ----- PROGRAMAR -----
-    if state == STATE_WAITING_SCHEDULE:
-        try:
-            dt = datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")
-        except ValueError:
-            return await msg.reply_text(
-                "Formato inválido.\nUsa: AAAA-MM-DD HH:MM"
-            )
-
-        draft["scheduled_at"] = dt
-        job_queue: Optional[JobQueue] = context.application.job_queue
-
-        if job_queue is None:
-            ud[STATE_KEY] = STATE_MAIN_MENU
-            await msg.reply_text(
-                "⚠ Este servidor no tiene JobQueue activo.\n"
-                "La publicación queda guardada; puedes usar 'Enviar ahora' desde la vista previa."
-            )
-            return await send_preview(update, context, "Vista previa (no se programó, envío manual):")
-
-        old_job = ud.get(SCHEDULE_JOB_KEY)
-        if old_job is not None:
-            old_job.schedule_removal()
-
-        job = job_queue.run_once(
-            scheduled_job_send_post,
-            when=dt,
-            data={
-                "chat_id": TARGET_CHAT_ID,
-                "admin_id": ADMIN_ID,
-                "type": draft["type"],
-                "file_id": draft["file_id"],
-                "text": draft["text"],
-                "buttons": draft["buttons"],
-            },
-            name="scheduled_post",
-        )
-        ud[SCHEDULE_JOB_KEY] = job
-        await msg.reply_text(f"📅 Publicación programada para {dt.strftime('%Y-%m-%d %H:%M')}")
-
-# MOSTRAR SOLO LA VISTA PREVIA, NO REGRESAR AL MENÚ
-return await send_preview(update, context, "Vista previa de la publicación programada:")
-
-
-    # Estado por defecto
-    await msg.reply_text("Usa el menú para gestionar tus publicaciones.")
-    await send_main_menu(update, context)
-
-
-# ================= ENVÍO AHORA =================
-
-async def send_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ud = context.user_data
-    draft = get_draft(ud)
-
-    if not draft["text"] and not draft["file_id"]:
-        return await update.effective_chat.send_message("No hay publicación en borrador.")
-
-    kb = build_buttons_keyboard(draft["buttons"])
-    t = draft["type"]
-    fid = draft["file_id"]
-    text = draft["text"] or ""
-
-    caption = text.strip() if text.strip() else None
-    safe_text = text.strip() if text.strip() else invisible_text()
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    draft = get_draft(user_id)
+    text = message.text.strip()
 
     try:
-        if t == "photo" and fid:
-            await context.bot.send_photo(
-                chat_id=TARGET_CHAT_ID,
-                photo=fid,
-                caption=caption,
-                reply_markup=kb,
-            )
-        elif t == "video" and fid:
-            await context.bot.send_video(
-                chat_id=TARGET_CHAT_ID,
-                video=fid,
-                caption=caption,
-                reply_markup=kb,
-            )
-        elif t == "audio" and fid:
-            await context.bot.send_audio(
-                chat_id=TARGET_CHAT_ID,
-                audio=fid,
-                caption=caption,
-                reply_markup=kb,
-            )
-        elif t == "voice" and fid:
-            await context.bot.send_voice(
-                chat_id=TARGET_CHAT_ID,
-                voice=fid,
-                caption=caption,
-                reply_markup=kb,
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=TARGET_CHAT_ID,
-                text=safe_text,
-                reply_markup=kb,
-            )
-    except Exception as e:
-        logger.exception("Error al enviar publicación inmediata")
-        await update.effective_chat.send_message(
-            f"⚠ Error al enviar la publicación:\n{e}"
+        scheduled_dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Formato inválido. Usa AAAA-MM-DD HH:MM (ejemplo: 2025-12-31 18:30).",
         )
         return
 
-    # Si había job programado, lo cancelamos
-    job = ud.get(SCHEDULE_JOB_KEY)
-    if job is not None:
-        job.schedule_removal()
-        ud[SCHEDULE_JOB_KEY] = None
-        draft["scheduled_at"] = None
+    now = datetime.now()
+    delta = (scheduled_dt - now).total_seconds()
+    if delta <= 0:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="La fecha y hora deben ser futuras.",
+        )
+        return
 
-    await update.effective_chat.send_message("✅ Publicación enviada al canal.")
-    await send_main_menu(update, context)
-
-
-# ================= JOB PROGRAMADO =================
-
-async def scheduled_job_send_post(context: ContextTypes.DEFAULT_TYPE) -> None:
-    data = context.job.data
-    chat_id = data["chat_id"]
-    admin_id = data["admin_id"]
-    t = data["type"]
-    fid = data["file_id"]
-    text = data["text"] or ""
-    buttons = data["buttons"]
-
-    kb = build_buttons_keyboard(buttons)
-    caption = text.strip() if text.strip() else None
-    safe_text = text.strip() if text.strip() else invisible_text()
-
-    try:
-        if t == "photo" and fid:
-            await context.bot.send_photo(chat_id=chat_id, photo=fid, caption=caption, reply_markup=kb)
-        elif t == "video" and fid:
-            await context.bot.send_video(chat_id=chat_id, video=fid, caption=caption, reply_markup=kb)
-        elif t == "audio" and fid:
-            await context.bot.send_audio(chat_id=chat_id, audio=fid, caption=caption, reply_markup=kb)
-        elif t == "voice" and fid:
-            await context.bot.send_voice(chat_id=chat_id, voice=fid, caption=caption, reply_markup=kb)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=safe_text, reply_markup=kb)
-    except Exception as e:
-        logger.exception("Error al enviar publicación programada")
+    if draft.get("job") is not None:
         try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"⚠ Error al enviar la publicación programada:\n{e}",
-            )
+            draft["job"].schedule_removal()
         except Exception:
             pass
+        draft["job"] = None
+
+    job = context.application.job_queue.run_once(
+        send_scheduled_publication,
+        delta,
+        data={"user_id": user_id},
+    )
+
+    draft["scheduled_at"] = scheduled_dt
+    draft["job"] = job
+    context.user_data["state"] = None
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Publicación programada correctamente.",
+    )
+    await send_draft_preview(user_id, chat_id, context)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "⬅️ Volver al menú",
+                callback_data="BACK_TO_MENU",
+            )
+        ]
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Usa el botón para volver al menú cuando quieras.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_edit_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if message is None or message.text is None:
         return
 
-    # Confirmación al admin
-    try:
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    draft = get_draft(user_id)
+
+    draft["text"] = message.text
+    context.user_data["state"] = None
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Texto del borrador actualizado.",
+    )
+    await send_draft_preview(user_id, chat_id, context)
+    await send_main_menu_simple(context, chat_id, user_id)
+
+
+async def handle_new_media(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if message is None:
+        return
+
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    draft = get_draft(user_id)
+
+    content_type: Optional[str] = None
+    file_id: Optional[str] = None
+    new_text: Optional[str] = None
+
+    if message.photo:
+        content_type = "photo"
+        file_id = message.photo[-1].file_id
+        new_text = message.caption
+    elif message.video:
+        content_type = "video"
+        file_id = message.video.file_id
+        new_text = message.caption
+    elif message.voice:
+        content_type = "voice"
+        file_id = message.voice.file_id
+        new_text = message.caption
+    else:
         await context.bot.send_message(
-            chat_id=admin_id,
+            chat_id=chat_id,
+            text="Debes enviar foto, video o nota de voz para cambiar la media.",
+        )
+        return
+
+    draft["type"] = content_type
+    draft["file_id"] = file_id
+
+    if new_text is not None and new_text.strip() != "":
+        draft["text"] = new_text
+
+    context.user_data["state"] = None
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Media del borrador actualizada.",
+    )
+    await send_draft_preview(user_id, chat_id, context)
+    await send_main_menu_simple(context, chat_id, user_id)
+
+
+async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    if job is None:
+        return
+    data = job.data or {}
+    user_id = data.get("user_id")
+    if user_id is None:
+        return
+
+    draft = DRAFTS.get(user_id)
+    if not draft_has_content(draft or {}):
+        return
+
+    try:
+        await send_publication_to_target(draft, context)  # type: ignore[arg-type]
+        draft["scheduled_at"] = None
+        draft["job"] = None
+        await context.bot.send_message(
+            chat_id=user_id,
             text="✅ Publicación programada enviada correctamente al canal.",
         )
-    except Exception:
-        # Segundo intento de seguridad
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text="✔ Se envió la publicación programada (confirmación de respaldo).",
-            )
-        except Exception:
-            pass
+    except Exception as exc:
+        logging.error("Error enviando publicación programada: %s", exc)
 
 
-# ================= MAIN =================
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin_private(update):
+        return
+
+    if update.message is None:
+        return
+
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+    init_user_structs(user_id)
+    state = context.user_data.get("state")
+
+    if state == "AWAITING_NEW_PUBLICATION_MESSAGE":
+        await handle_new_publication_message(update, context)
+    elif state in ("AWAITING_NEW_BUTTONS_TEXT", "AWAITING_EDIT_BUTTONS_TEXT"):
+        await handle_new_buttons_text(update, context)
+    elif state == "AWAITING_SCHEDULE_DATETIME":
+        await handle_schedule_datetime(update, context)
+    elif state == "AWAITING_EDIT_TEXT":
+        await handle_edit_text(update, context)
+    elif state == "AWAITING_NEW_MEDIA":
+        await handle_new_media(update, context)
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Usa el menú para gestionar la publicación.",
+        )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.error("Excepción en el manejador", exc_info=context.error)
+
 
 def main() -> None:
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO,
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(menu_callback))
-    app.add_handler(MessageHandler(~filters.COMMAND, message_handler))
+    token = os.getenv("BOT_TOKEN")
+    admin_id_str = os.getenv("ADMIN_ID")
+    target_chat = os.getenv("TARGET_CHAT_ID")
 
-    logger.info("Bot de publicaciones avanzado iniciado.")
-    app.run_polling()
+    if not token or not admin_id_str or not target_chat:
+        raise RuntimeError(
+            "Faltan variables de entorno: BOT_TOKEN, ADMIN_ID o TARGET_CHAT_ID."
+        )
+
+    global ADMIN_ID, TARGET_CHAT_ID
+    try:
+        ADMIN_ID = int(admin_id_str)
+    except ValueError:
+        raise RuntimeError("ADMIN_ID debe ser un número entero válido.")
+
+    TARGET_CHAT_ID = target_chat
+
+    application = ApplicationBuilder().token(token).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(on_button))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+    application.add_error_handler(error_handler)
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
