@@ -577,6 +577,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ],
             [
                 InlineKeyboardButton(
+                    "📚 Ver plantillas guardadas", callback_data="TEMPLATE_VIEW"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "🗑 Eliminar plantilla guardada", callback_data="TEMPLATE_DELETE"
                 )
             ],
@@ -903,6 +908,106 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     "Plantillas guardadas:\n"
                     f"{listing}\n\n"
                     "Envía el número de la plantilla que quieres eliminar."
+                ),
+            )
+
+
+    elif data == "TEMPLATE_VIEW":
+        templates = get_templates(user_id)
+        if not templates:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay plantillas guardadas para mostrar.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            keyboard_rows: List[List[InlineKeyboardButton]] = []
+            for idx, tpl in enumerate(templates):
+                keyboard_rows.append(
+                    [
+                        InlineKeyboardButton(
+                            tpl["title"],
+                            callback_data=f"TEMPLATE_VIEW_PICK_{idx}",
+                        )
+                    ]
+                )
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Volver al menú de plantillas", callback_data="MENU_TEMPLATES"
+                    )
+                ]
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Elige la plantilla que quieres ver o editar:",
+                reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            )
+
+    elif data.startswith("TEMPLATE_VIEW_PICK_"):
+        try:
+            idx = int(data.split("_")[-1])
+        except ValueError:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Plantilla no válida.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+            return
+        templates = get_templates(user_id)
+        if idx < 0 or idx >= len(templates):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Plantilla no válida.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+            return
+
+        context.user_data["template_edit_index"] = idx
+        tpl = templates[idx]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Plantilla seleccionada:\n"
+                f"{tpl['title']}\n\n"
+                "Texto actual:\n"
+                f"{tpl['text']}"
+            ),
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "✏ Editar esta plantilla", callback_data="TEMPLATE_EDIT_CURRENT"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Volver a la lista de plantillas", callback_data="TEMPLATE_VIEW"
+                )
+            ],
+        ]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="¿Qué quieres hacer con esta plantilla?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data == "TEMPLATE_EDIT_CURRENT":
+        templates = get_templates(user_id)
+        idx = context.user_data.get("template_edit_index")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(templates):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay una plantilla válida seleccionada para editar.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            context.user_data["state"] = "AWAITING_EDIT_TEMPLATE_TEXT"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Envía ahora el TEXTO COMPLETO corregido para esta plantilla.\n"
+                    "Este texto reemplazará al contenido anterior."
                 ),
             )
 
@@ -1378,6 +1483,40 @@ async def handle_delete_template_index(
     await send_main_menu_simple(context, chat_id, user_id)
 
 
+async def handle_edit_template_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if message is None or message.text is None:
+        return
+
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+    defaults = get_defaults(user_id)
+    templates = defaults.get("templates", [])
+
+    idx = context.user_data.get("template_edit_index")
+    if not isinstance(idx, int) or idx < 0 or idx >= len(templates):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="No hay una plantilla válida seleccionada para guardar cambios.",
+        )
+        context.user_data["state"] = None
+        return
+
+    templates[idx]["text"] = message.text
+    defaults["templates"] = templates
+    context.user_data["state"] = None
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Plantilla actualizada correctamente.",
+    )
+    await send_main_menu_simple(context, chat_id, user_id)
+
+
+
 # --------- JobQueue ---------
 async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
@@ -1448,6 +1587,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await handle_delete_button_index(update, context)
     elif state == "AWAITING_DELETE_TEMPLATE_INDEX":
         await handle_delete_template_index(update, context)
+    elif state == "AWAITING_EDIT_TEMPLATE_TEXT":
+        await handle_edit_template_text(update, context)
     else:
         await context.bot.send_message(
             chat_id=chat_id,
