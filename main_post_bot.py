@@ -26,6 +26,7 @@ ADMIN_ID: int = 0
 TARGET_CHAT_ID: Any = None
 
 
+# --------- Utilidades de estado y estructuras ---------
 def init_user_structs(user_id: int) -> None:
     if user_id not in DRAFTS:
         DRAFTS[user_id] = {
@@ -43,8 +44,8 @@ def init_user_structs(user_id: int) -> None:
         }
 
 
-def draft_has_content(draft: Dict[str, Any]) -> bool:
-    if draft is None:
+def draft_has_content(draft: Optional[Dict[str, Any]]) -> bool:
+    if not draft:
         return False
     if draft.get("type"):
         return True
@@ -52,6 +53,39 @@ def draft_has_content(draft: Dict[str, Any]) -> bool:
     return text.strip() != ""
 
 
+def get_draft(user_id: int) -> Dict[str, Any]:
+    init_user_structs(user_id)
+    return DRAFTS[user_id]
+
+
+def get_defaults(user_id: int) -> Dict[str, Any]:
+    init_user_structs(user_id)
+    return DEFAULTS[user_id]
+
+
+def is_admin_private(update: Update) -> bool:
+    if update.effective_user is None or update.effective_chat is None:
+        return False
+
+    user_id = update.effective_user.id
+    chat = update.effective_chat
+
+    if chat.type != "private" or user_id != ADMIN_ID:
+        try:
+            text = "Bot privado. No tienes permiso para usar este bot."
+            if update.message:
+                update.message.reply_text(text)  # type: ignore[union-attr]
+            elif update.callback_query:
+                update.callback_query.answer(text, show_alert=True)  # type: ignore[union-attr]
+            else:
+                chat.send_message(text=text)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+# --------- Construcción de menús ---------
 def build_main_menu_text(user_id: int) -> str:
     draft = DRAFTS.get(user_id)
     defaults = DEFAULTS.get(user_id, {"buttons": [], "template_text": ""})
@@ -61,15 +95,13 @@ def build_main_menu_text(user_id: int) -> str:
         botones_count = 0
         prog = "Sin programación"
     else:
-        text = draft.get("text") or ""
-        text = text.strip()
+        text = (draft.get("text") or "").strip()
         if not text and not draft.get("type"):
             resumen = "(Sin publicación)"
         else:
-            if len(text) > 300:
-                resumen = text[:300] + "..."
-            else:
-                resumen = text if text else "(Publicación sin texto)"
+            resumen = text if len(text) <= 300 else text[:300] + "..."
+            if not resumen:
+                resumen = "(Publicación sin texto)"
         botones_count = len(draft.get("buttons") or [])
         if draft.get("scheduled_at"):
             prog = draft["scheduled_at"].strftime("%Y-%m-%d %H:%M")
@@ -117,6 +149,50 @@ def build_main_menu_keyboard() -> List[List[InlineKeyboardButton]]:
     return keyboard
 
 
+def build_buttons_menu_keyboard() -> List[List[InlineKeyboardButton]]:
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ Crear nuevos botones", callback_data="BUTTONS_MENU_CREATE_NEW"),
+        ],
+        [
+            InlineKeyboardButton("🟢 Usar botones predeterminados", callback_data="BUTTONS_MENU_USE_DEFAULT"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Editar botones existentes", callback_data="BUTTONS_MENU_EDIT_EXISTING"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Eliminar TODOS los botones", callback_data="BUTTONS_MENU_DELETE_ALL"),
+        ],
+        [
+            InlineKeyboardButton("➖ Eliminar UN botón", callback_data="BUTTONS_MENU_DELETE_ONE"),
+        ],
+        [
+            InlineKeyboardButton("💾 Guardar actuales como predeterminados", callback_data="BUTTONS_MENU_SAVE_DEFAULTS"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU"),
+        ],
+    ]
+    return keyboard
+
+
+def build_final_action_keyboard() -> List[List[InlineKeyboardButton]]:
+    keyboard = [
+        [
+            InlineKeyboardButton("📤 Enviar ahora", callback_data="MENU_SEND_NOW"),
+            InlineKeyboardButton("⏰ Programar", callback_data="MENU_SCHEDULE"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Editar publicación", callback_data="MENU_EDIT"),
+        ],
+        [
+            InlineKeyboardButton("💾 Guardar borrador", callback_data="FINAL_SAVE_DRAFT"),
+            InlineKeyboardButton("🔙 Volver al menú", callback_data="BACK_TO_MENU"),
+        ],
+    ]
+    return keyboard
+
+
 async def send_main_menu_simple(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
 ) -> None:
@@ -129,38 +205,7 @@ async def send_main_menu_simple(
     )
 
 
-def is_admin_private(update: Update) -> bool:
-    if update.effective_user is None or update.effective_chat is None:
-        return False
-
-    user_id = update.effective_user.id
-    chat = update.effective_chat
-
-    if chat.type != "private" or user_id != ADMIN_ID:
-        try:
-            text = "Bot privado. No tienes permiso para usar este bot."
-            if update.message:
-                update.message.reply_text(text)  # type: ignore[union-attr]
-            elif update.callback_query:
-                update.callback_query.answer(text, show_alert=True)  # type: ignore[union-attr]
-            else:
-                chat.send_message(text=text)
-        except Exception:
-            pass
-        return False
-    return True
-
-
-def get_draft(user_id: int) -> Dict[str, Any]:
-    init_user_structs(user_id)
-    return DRAFTS[user_id]
-
-
-def get_defaults(user_id: int) -> Dict[str, Any]:
-    init_user_structs(user_id)
-    return DEFAULTS[user_id]
-
-
+# --------- Vista previa y envío ---------
 async def send_draft_preview(
     user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -246,6 +291,7 @@ async def send_publication_to_target(
         )
 
 
+# --------- Comandos ---------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin_private(update):
         return
@@ -258,6 +304,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_main_menu_simple(context, chat_id, user_id)
 
 
+# --------- Callbacks de botones ---------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -269,12 +316,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user_id = update.effective_user.id  # type: ignore[union-attr]
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
-
-    init_user_structs(user_id)
     data = query.data or ""
 
+    init_user_structs(user_id)
+
+    # --- Menú principal ---
     if data == "MENU_CREATE":
         context.user_data["state"] = "AWAITING_NEW_PUBLICATION_MESSAGE"
+        context.user_data["after_buttons_action"] = "FINAL_MENU"
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -283,93 +332,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ),
         )
 
-    elif data == "MENU_BUTTONS" or data == "ADD_BUTTONS_AFTER_NEW":
-        defaults = get_defaults(user_id)
-        if defaults.get("buttons"):
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "🟢 Usar botones predeterminados",
-                        callback_data="BUTTONS_USE_DEFAULT",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "✏️ Crear nuevos botones",
-                        callback_data="BUTTONS_CREATE_NEW",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Volver al menú",
-                        callback_data="BACK_TO_MENU",
-                    )
-                ],
-            ]
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Elige una opción para los botones:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-        else:
-            context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
-            context.user_data["buttons_mode"] = "CREATE"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Envía todos los botones en un solo mensaje, uno por línea, "
-                    'con el formato "Texto del botón - URL".'
-                ),
-            )
-
-    elif data == "BUTTONS_USE_DEFAULT":
-        defaults = get_defaults(user_id)
-        draft = get_draft(user_id)
-        if not defaults.get("buttons"):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="No hay botones predeterminados guardados.",
-            )
-        else:
-            draft["buttons"] = copy.deepcopy(defaults["buttons"])
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Botones predeterminados aplicados al borrador.",
-            )
-            await send_draft_preview(user_id, chat_id, context)
-        await send_main_menu_simple(context, chat_id, user_id)
-
-    elif data == "BUTTONS_CREATE_NEW":
-        context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
-        context.user_data["buttons_mode"] = "CREATE"
+    elif data == "MENU_BUTTONS":
+        context.user_data["after_buttons_action"] = "MAIN_MENU"
         await context.bot.send_message(
             chat_id=chat_id,
-            text=(
-                "Envía todos los botones en un solo mensaje, uno por línea, "
-                'con el formato "Texto del botón - URL".'
-            ),
+            text="Gestión de botones para el borrador actual:",
+            reply_markup=InlineKeyboardMarkup(build_buttons_menu_keyboard()),
         )
-
-    elif data == "SAVE_BUTTONS_YES":
-        draft = get_draft(user_id)
-        defaults = get_defaults(user_id)
-        defaults["buttons"] = copy.deepcopy(draft.get("buttons") or [])
-        context.user_data["state"] = None
-        context.user_data.pop("buttons_mode", None)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Botones guardados como predeterminados.",
-        )
-        await send_main_menu_simple(context, chat_id, user_id)
-
-    elif data == "SAVE_BUTTONS_NO":
-        context.user_data["state"] = None
-        context.user_data.pop("buttons_mode", None)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Botones usados solo en este borrador.",
-        )
-        await send_main_menu_simple(context, chat_id, user_id)
 
     elif data == "MENU_SCHEDULE":
         draft = get_draft(user_id)
@@ -421,30 +390,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await send_main_menu_simple(context, chat_id, user_id)
         else:
             keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "✏️ Editar texto",
-                        callback_data="EDIT_TEXT",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔗 Editar botones",
-                        callback_data="EDIT_BUTTONS",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🖼 Cambiar media",
-                        callback_data="EDIT_MEDIA",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Volver al menú",
-                        callback_data="BACK_TO_MENU",
-                    )
-                ],
+                [InlineKeyboardButton("✏️ Editar texto", callback_data="EDIT_TEXT")],
+                [InlineKeyboardButton("🔗 Editar botones", callback_data="EDIT_BUTTONS")],
+                [InlineKeyboardButton("🖼 Cambiar media", callback_data="EDIT_MEDIA")],
+                [InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU")],
             ]
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -452,78 +401,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
 
-    elif data == "EDIT_TEXT":
-        draft = get_draft(user_id)
-        if not draft_has_content(draft):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="No hay borrador para editar el texto.",
-            )
-            await send_main_menu_simple(context, chat_id, user_id)
-        else:
-            context.user_data["state"] = "AWAITING_EDIT_TEXT"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Envía ahora el nuevo texto de la publicación.",
-            )
-
-    elif data == "EDIT_BUTTONS":
-        draft = get_draft(user_id)
-        if not draft_has_content(draft):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="No hay borrador para editar los botones.",
-            )
-            await send_main_menu_simple(context, chat_id, user_id)
-        else:
-            context.user_data["state"] = "AWAITING_EDIT_BUTTONS_TEXT"
-            context.user_data["buttons_mode"] = "EDIT"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Envía todos los botones en un solo mensaje, uno por línea, "
-                    'con el formato "Texto del botón - URL".'
-                ),
-            )
-
-    elif data == "EDIT_MEDIA":
-        draft = get_draft(user_id)
-        if not draft_has_content(draft):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="No hay borrador para cambiar la media.",
-            )
-            await send_main_menu_simple(context, chat_id, user_id)
-        else:
-            context.user_data["state"] = "AWAITING_NEW_MEDIA"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Envía ahora la nueva media (foto, video o nota de voz). "
-                    "Si no envías texto, se conservará el texto actual."
-                ),
-            )
-
     elif data == "MENU_TEMPLATES":
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "💾 Guardar borrador como plantilla",
-                    callback_data="TEMPLATE_SAVE",
+                    "💾 Guardar borrador como plantilla", callback_data="TEMPLATE_SAVE"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "📥 Insertar plantilla en borrador",
-                    callback_data="TEMPLATE_INSERT",
+                    "📥 Insertar plantilla en borrador", callback_data="TEMPLATE_INSERT"
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Volver al menú",
-                    callback_data="BACK_TO_MENU",
-                )
-            ],
+            [InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU")],
         ]
         await context.bot.send_message(
             chat_id=chat_id,
@@ -531,6 +421,208 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
+    elif data == "MENU_CANCEL_DRAFT":
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "Sí, cancelar borrador", callback_data="CONFIRM_CANCEL_DRAFT"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU")],
+        ]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="¿Seguro que quieres cancelar y borrar el borrador actual?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    # --- Confirmaciones ---
+    elif data == "CONFIRM_CANCEL_DRAFT":
+        draft = get_draft(user_id)
+        if draft.get("job") is not None:
+            try:
+                draft["job"].schedule_removal()
+            except Exception:
+                pass
+        DRAFTS[user_id] = {
+            "type": None,
+            "file_id": None,
+            "text": "",
+            "buttons": [],
+            "scheduled_at": None,
+            "job": None,
+        }
+        context.user_data.clear()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Borrador cancelado.",
+        )
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    elif data == "BACK_TO_MENU":
+        context.user_data["state"] = None
+        context.user_data.pop("buttons_context", None)
+        context.user_data.pop("after_buttons_action", None)
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    elif data == "FINAL_SAVE_DRAFT":
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Borrador guardado.",
+        )
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    # --- Flujo de botones después de nueva publicación ---
+    elif data == "NEW_USE_DEFAULT_BUTTONS":
+        defaults = get_defaults(user_id)
+        draft = get_draft(user_id)
+        if not defaults.get("buttons"):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay botones predeterminados guardados.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            draft["buttons"] = copy.deepcopy(defaults["buttons"])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Botones predeterminados aplicados al borrador.",
+            )
+            await send_draft_preview(user_id, chat_id, context)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="¿Qué quieres hacer ahora?",
+                reply_markup=InlineKeyboardMarkup(build_final_action_keyboard()),
+            )
+
+    elif data == "NEW_CREATE_BUTTONS":
+        context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
+        context.user_data["buttons_context"] = "from_new"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Envía todos los botones en un solo mensaje, uno por línea,\n"
+                'con el formato "Texto del botón - URL".'
+            ),
+        )
+
+    # --- Menú general de botones ---
+    elif data == "BUTTONS_MENU_CREATE_NEW":
+        context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
+        context.user_data["buttons_context"] = "from_buttons_menu"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Envía todos los botones en un solo mensaje, uno por línea,\n"
+                'con el formato "Texto del botón - URL".'
+            ),
+        )
+
+    elif data == "BUTTONS_MENU_USE_DEFAULT":
+        defaults = get_defaults(user_id)
+        draft = get_draft(user_id)
+        if not defaults.get("buttons"):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay botones predeterminados guardados.",
+            )
+        else:
+            draft["buttons"] = copy.deepcopy(defaults["buttons"])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Botones predeterminados aplicados al borrador.",
+            )
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    elif data == "BUTTONS_MENU_EDIT_EXISTING":
+        draft = get_draft(user_id)
+        if not draft.get("buttons"):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay botones en el borrador para editar.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
+            context.user_data["buttons_context"] = "from_buttons_menu"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Vas a reemplazar los botones actuales.\n"
+                    "Envía todos los botones en un solo mensaje, uno por línea,\n"
+                    'con el formato "Texto del botón - URL".'
+                ),
+            )
+
+    elif data == "BUTTONS_MENU_DELETE_ALL":
+        draft = get_draft(user_id)
+        draft["buttons"] = []
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Todos los botones del borrador han sido eliminados.",
+        )
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    elif data == "BUTTONS_MENU_DELETE_ONE":
+        draft = get_draft(user_id)
+        buttons = draft.get("buttons") or []
+        if not buttons:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay botones en el borrador para eliminar.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            lines = []
+            for idx, row in enumerate(buttons, start=1):
+                btn = row[0]
+                lines.append(f"{idx}. {btn.text} - {btn.url}")
+            listing = "\n".join(lines)
+            context.user_data["state"] = "AWAITING_DELETE_BUTTON_INDEX"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Botones actuales:\n"
+                    f"{listing}\n\n"
+                    "Envía el número del botón que quieres eliminar."
+                ),
+            )
+
+    elif data == "BUTTONS_MENU_SAVE_DEFAULTS":
+        draft = get_draft(user_id)
+        if not draft.get("buttons"):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay botones en el borrador para guardar como predeterminados.",
+            )
+        else:
+            defaults = get_defaults(user_id)
+            defaults["buttons"] = copy.deepcopy(draft["buttons"])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Botones actuales guardados como predeterminados.",
+            )
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    # --- Guardar o no como predeterminados tras crear botones ---
+    elif data == "SAVE_BUTTONS_YES":
+        draft = get_draft(user_id)
+        defaults = get_defaults(user_id)
+        defaults["buttons"] = copy.deepcopy(draft.get("buttons") or [])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Botones guardados como predeterminados.",
+        )
+        await _after_buttons_flow(user_id, chat_id, context)
+
+    elif data == "SAVE_BUTTONS_NO":
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Botones usados solo en este borrador.",
+        )
+        await _after_buttons_flow(user_id, chat_id, context)
+
+    # --- Plantillas ---
     elif data == "TEMPLATE_SAVE":
         draft = get_draft(user_id)
         if not draft.get("text"):
@@ -575,53 +667,59 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await send_draft_preview(user_id, chat_id, context)
             await send_main_menu_simple(context, chat_id, user_id)
 
-    elif data == "MENU_CANCEL_DRAFT":
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "Sí, cancelar borrador",
-                    callback_data="CONFIRM_CANCEL_DRAFT",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Volver al menú",
-                    callback_data="BACK_TO_MENU",
-                )
-            ],
-        ]
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="¿Seguro que quieres cancelar y borrar el borrador actual?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-
-    elif data == "CONFIRM_CANCEL_DRAFT":
+    # --- Edición desde menú Editar ---
+    elif data == "EDIT_TEXT":
         draft = get_draft(user_id)
-        if draft.get("job") is not None:
-            try:
-                draft["job"].schedule_removal()
-            except Exception:
-                pass
-        DRAFTS[user_id] = {
-            "type": None,
-            "file_id": None,
-            "text": "",
-            "buttons": [],
-            "scheduled_at": None,
-            "job": None,
-        }
-        context.user_data.clear()
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Borrador cancelado.",
-        )
-        await send_main_menu_simple(context, chat_id, user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador para editar el texto.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            context.user_data["state"] = "AWAITING_EDIT_TEXT"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Envía ahora el nuevo texto de la publicación.",
+            )
 
-    elif data == "BACK_TO_MENU":
-        context.user_data["state"] = None
-        context.user_data.pop("buttons_mode", None)
-        await send_main_menu_simple(context, chat_id, user_id)
+    elif data == "EDIT_BUTTONS":
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador para editar los botones.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
+            context.user_data["buttons_context"] = "from_edit_menu"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Vas a reemplazar los botones actuales.\n"
+                    "Envía todos los botones en un solo mensaje, uno por línea,\n"
+                    'con el formato "Texto del botón - URL".'
+                ),
+            )
+
+    elif data == "EDIT_MEDIA":
+        draft = get_draft(user_id)
+        if not draft_has_content(draft):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay borrador para cambiar la media.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            context.user_data["state"] = "AWAITING_NEW_MEDIA"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Envía ahora la nueva media (foto, video o nota de voz).\n"
+                    "Si no envías texto, se conservará el texto actual."
+                ),
+            )
 
     else:
         await context.bot.send_message(
@@ -631,6 +729,30 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_main_menu_simple(context, chat_id, user_id)
 
 
+async def _after_buttons_flow(
+    user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Flujo después de crear botones y contestar si se guardan como predeterminados."""
+    context.user_data["state"] = None
+    buttons_context = context.user_data.get("buttons_context")
+    after_action = context.user_data.get("after_buttons_action")
+
+    # Vista previa solo una vez después de definir botones
+    await send_draft_preview(user_id, chat_id, context)
+
+    if after_action == "FINAL_MENU" or buttons_context in ("from_new", "from_edit_menu"):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="¿Qué quieres hacer ahora?",
+            reply_markup=InlineKeyboardMarkup(build_final_action_keyboard()),
+        )
+    else:
+        await send_main_menu_simple(context, chat_id, user_id)
+
+    context.user_data.pop("buttons_context", None)
+
+
+# --------- Parsers ---------
 def parse_buttons_from_text(text: str) -> List[List[InlineKeyboardButton]]:
     lines = (text or "").splitlines()
     rows: List[List[InlineKeyboardButton]] = []
@@ -650,6 +772,7 @@ def parse_buttons_from_text(text: str) -> List[List[InlineKeyboardButton]]:
     return rows
 
 
+# --------- Manejadores de mensajes según estado ---------
 async def handle_new_publication_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -699,25 +822,38 @@ async def handle_new_publication_message(
         text="Publicación guardada en el borrador.",
     )
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ Añadir / editar botones",
-                callback_data="ADD_BUTTONS_AFTER_NEW",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Volver al menú",
-                callback_data="BACK_TO_MENU",
-            )
-        ],
-    ]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="¿Quieres añadir botones a esta publicación?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    # Siempre vas a añadir botones: preguntar si usar predeterminados o crear nuevos
+    defaults = get_defaults(user_id)
+    if defaults.get("buttons"):
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "✔ Usar botones predeterminados",
+                    callback_data="NEW_USE_DEFAULT_BUTTONS",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ No, crear nuevos botones",
+                    callback_data="NEW_CREATE_BUTTONS",
+                )
+            ],
+        ]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="¿Quieres usar los botones predeterminados que tienes guardados?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        context.user_data["state"] = "AWAITING_NEW_BUTTONS_TEXT"
+        context.user_data["buttons_context"] = "from_new"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Envía todos los botones en un solo mensaje, uno por línea,\n"
+                'con el formato "Texto del botón - URL".'
+            ),
+        )
 
 
 async def handle_new_buttons_text(
@@ -741,15 +877,8 @@ async def handle_new_buttons_text(
         return
 
     draft["buttons"] = rows
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Botones actualizados en el borrador.",
-    )
-    # ÚNICA vista previa completa después de definir botones
-    await send_draft_preview(user_id, chat_id, context)
-
     context.user_data["state"] = "AWAITING_SAVE_DEFAULT_BUTTONS_CHOICE"
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -766,7 +895,7 @@ async def handle_new_buttons_text(
     ]
     await context.bot.send_message(
         chat_id=chat_id,
-        text="¿Quieres guardar estos botones como predeterminados?",
+        text="Botones actualizados. ¿Quieres guardar estos botones como predeterminados?",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -795,7 +924,7 @@ async def handle_schedule_datetime(
     now = datetime.now()
     delta = (scheduled_dt - now).total_seconds()
 
-    # Permitimos pequeños desfases de reloj; solo rechazamos si está claramente en el pasado
+    # Permitimos pequeño margen; solo rechazamos claramente pasado más de 1 minuto
     if delta <= -60:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -803,7 +932,7 @@ async def handle_schedule_datetime(
         )
         return
 
-    delay = max(delta, 1.0)
+    delay = max(delta, 60.0)  # al menos 1 minuto
 
     if draft.get("job") is not None:
         try:
@@ -831,12 +960,7 @@ async def handle_schedule_datetime(
     )
 
     keyboard = [
-        [
-            InlineKeyboardButton(
-                "⬅️ Volver al menú",
-                callback_data="BACK_TO_MENU",
-            )
-        ]
+        [InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU")]
     ]
     await context.bot.send_message(
         chat_id=chat_id,
@@ -864,7 +988,11 @@ async def handle_edit_text(
         text="Texto del borrador actualizado.",
     )
     await send_draft_preview(user_id, chat_id, context)
-    await send_main_menu_simple(context, chat_id, user_id)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="¿Qué quieres hacer ahora?",
+        reply_markup=InlineKeyboardMarkup(build_final_action_keyboard()),
+    )
 
 
 async def handle_new_media(
@@ -914,9 +1042,54 @@ async def handle_new_media(
         text="Media del borrador actualizada.",
     )
     await send_draft_preview(user_id, chat_id, context)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="¿Qué quieres hacer ahora?",
+        reply_markup=InlineKeyboardMarkup(build_final_action_keyboard()),
+    )
+
+
+async def handle_delete_button_index(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if message is None or message.text is None:
+        return
+
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    draft = get_draft(user_id)
+    buttons = draft.get("buttons") or []
+
+    try:
+        idx = int(message.text.strip())
+    except ValueError:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Debes enviar un número válido.",
+        )
+        return
+
+    if idx < 1 or idx > len(buttons):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Número fuera de rango.",
+        )
+        return
+
+    removed = buttons.pop(idx - 1)
+    draft["buttons"] = buttons
+    context.user_data["state"] = None
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Botón '{removed[0].text}' eliminado.",
+    )
+    await send_draft_preview(user_id, chat_id, context)
     await send_main_menu_simple(context, chat_id, user_id)
 
 
+# --------- JobQueue ---------
 async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
     if job is None:
@@ -927,7 +1100,7 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     draft = DRAFTS.get(user_id)
-    if not draft_has_content(draft or {}):
+    if not draft_has_content(draft):
         return
 
     try:
@@ -942,6 +1115,7 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
         logging.error("Error enviando publicación programada: %s", exc)
 
 
+# --------- Router de mensajes ---------
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin_private(update):
         return
@@ -957,7 +1131,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if state == "AWAITING_NEW_PUBLICATION_MESSAGE":
         await handle_new_publication_message(update, context)
-    elif state in ("AWAITING_NEW_BUTTONS_TEXT", "AWAITING_EDIT_BUTTONS_TEXT"):
+    elif state == "AWAITING_NEW_BUTTONS_TEXT":
         await handle_new_buttons_text(update, context)
     elif state == "AWAITING_SCHEDULE_DATETIME":
         await handle_schedule_datetime(update, context)
@@ -965,6 +1139,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await handle_edit_text(update, context)
     elif state == "AWAITING_NEW_MEDIA":
         await handle_new_media(update, context)
+    elif state == "AWAITING_DELETE_BUTTON_INDEX":
+        await handle_delete_button_index(update, context)
     else:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -972,10 +1148,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
+# --------- Errores ---------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logging.error("Excepción en el manejador", exc_info=context.error)
 
 
+# --------- Main ---------
 def main() -> None:
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
