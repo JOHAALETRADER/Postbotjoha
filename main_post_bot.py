@@ -108,11 +108,13 @@ def _make_template_title(text: str, index: int) -> str:
         shortened = []
         total = 0
         for w in selected_words:
-            if total + len(w) + (1 if shortened else 0) > 40:
+            extra = len(w) + (1 if shortened else 0)
+            if total + extra > 40:
                 break
             shortened.append(w)
-            total += len(w) + (1 if shortened else 0)
-        title = " ".join(shortened)
+            total += extra
+        if shortened:
+            title = " ".join(shortened)
     if len(words) > 5 or len(clean) > len(title):
         title += "..."
     return title
@@ -373,7 +375,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # --- Menú principal ---
     if data == "MENU_CREATE":
-        # Preguntar si usar plantilla si existen
         templates = get_templates(user_id)
         if templates:
             keyboard = [
@@ -561,6 +562,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             [
                 InlineKeyboardButton(
                     "📥 Insertar plantilla en borrador", callback_data="TEMPLATE_INSERT"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗑 Eliminar plantilla guardada", callback_data="TEMPLATE_DELETE"
                 )
             ],
             [InlineKeyboardButton("❌ Cancelar y volver", callback_data="BACK_TO_MENU")],
@@ -866,6 +872,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_draft_preview(user_id, chat_id, context)
         await send_main_menu_simple(context, chat_id, user_id)
 
+    elif data == "TEMPLATE_DELETE":
+        templates = get_templates(user_id)
+        if not templates:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay plantillas guardadas para eliminar.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            lines = []
+            for idx, tpl in enumerate(templates, start=1):
+                lines.append(f"{idx}. {tpl['title']}")
+            listing = "\n".join(lines)
+            context.user_data["state"] = "AWAITING_DELETE_TEMPLATE_INDEX"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Plantillas guardadas:\n"
+                    f"{listing}\n\n"
+                    "Envía el número de la plantilla que quieres eliminar."
+                ),
+            )
+
     # --- Edición desde menú Editar ---
     elif data == "EDIT_TEXT":
         draft = get_draft(user_id)
@@ -1133,10 +1162,11 @@ async def handle_schedule_datetime(
     now_utc = datetime.now(timezone.utc)
     delta = (utc_dt - now_utc).total_seconds()
 
-    if delta <= 60:
+    # Aceptamos cualquier hora futura aunque falten pocos segundos
+    if delta < 1:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="La fecha y hora deben ser futuras (al menos 1 minuto desde ahora).",
+            text="La fecha y hora deben ser futuras.",
         )
         return
 
@@ -1297,6 +1327,46 @@ async def handle_delete_button_index(
     await send_main_menu_simple(context, chat_id, user_id)
 
 
+async def handle_delete_template_index(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if message is None or message.text is None:
+        return
+
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+    defaults = get_defaults(user_id)
+    templates = defaults.get("templates", [])
+
+    try:
+        idx = int(message.text.strip())
+    except ValueError:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Debes enviar un número válido.",
+        )
+        return
+
+    if idx < 1 or idx > len(templates):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Número fuera de rango.",
+        )
+        return
+
+    removed = templates.pop(idx - 1)
+    defaults["templates"] = templates
+    context.user_data["state"] = None
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Plantilla '{removed['title']}' eliminada.",
+    )
+    await send_main_menu_simple(context, chat_id, user_id)
+
+
 # --------- JobQueue ---------
 async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
@@ -1354,6 +1424,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await handle_new_media(update, context)
     elif state == "AWAITING_DELETE_BUTTON_INDEX":
         await handle_delete_button_index(update, context)
+    elif state == "AWAITING_DELETE_TEMPLATE_INDEX":
+        await handle_delete_template_index(update, context)
     else:
         await context.bot.send_message(
             chat_id=chat_id,
