@@ -1,7 +1,7 @@
 import logging
 import os
 import copy
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 
 from telegram import (
@@ -40,8 +40,12 @@ def init_user_structs(user_id: int) -> None:
     if user_id not in DEFAULTS:
         DEFAULTS[user_id] = {
             "buttons": [],
-            "template_text": "",
+            "templates": [],  # cada item: {"id": int, "title": str, "text": str}
         }
+    else:
+        # migración simple si venía de versión anterior
+        if "templates" not in DEFAULTS[user_id]:
+            DEFAULTS[user_id]["templates"] = []
 
 
 def draft_has_content(draft: Optional[Dict[str, Any]]) -> bool:
@@ -85,10 +89,35 @@ def is_admin_private(update: Update) -> bool:
     return True
 
 
+# --------- Plantillas ---------
+def _make_template_title(text: str, index: int) -> str:
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return f"Plantilla {index}"
+    words = clean.split()
+    title = " ".join(words[:3])
+    return title
+
+
+def save_template_from_text(user_id: int, text: str) -> str:
+    defaults = get_defaults(user_id)
+    templates: List[Dict[str, str]] = defaults.get("templates", [])
+    idx = len(templates) + 1
+    title = _make_template_title(text, idx)
+    templates.append({"id": idx, "title": title, "text": text})
+    defaults["templates"] = templates
+    return title
+
+
+def get_templates(user_id: int) -> List[Dict[str, str]]:
+    defaults = get_defaults(user_id)
+    return defaults.get("templates", [])
+
+
 # --------- Construcción de menús ---------
 def build_main_menu_text(user_id: int) -> str:
     draft = DRAFTS.get(user_id)
-    defaults = DEFAULTS.get(user_id, {"buttons": [], "template_text": ""})
+    defaults = DEFAULTS.get(user_id, {"buttons": [], "templates": []})
 
     if not draft:
         resumen = "(Sin publicación)"
@@ -108,21 +137,21 @@ def build_main_menu_text(user_id: int) -> str:
         else:
             prog = "Sin programación"
 
+    has_templates = bool(defaults.get("templates"))
     has_default_buttons = bool(defaults.get("buttons"))
-    has_template = bool((defaults.get("template_text") or "").strip())
 
     text_menu = (
         "Borrador actual:\n"
         "{resumen}\n\n"
-        "Botones: {botones}\n"
+        "Botones en borrador: {botones}\n"
         "Botones predeterminados: {pred}\n"
-        "Plantilla recurrente: {plantilla}\n"
+        "Plantillas guardadas: {plantillas}\n"
         "Programación: {prog}\n"
     ).format(
         resumen=resumen,
         botones=botones_count,
         pred="Sí" if has_default_buttons else "No",
-        plantilla="Sí" if has_template else "No",
+        plantillas=len(defaults.get("templates", [])) if has_templates else 0,
         prog=prog,
     )
     return text_menu
@@ -186,7 +215,10 @@ def build_final_action_keyboard() -> List[List[InlineKeyboardButton]]:
             InlineKeyboardButton("✏️ Editar publicación", callback_data="MENU_EDIT"),
         ],
         [
-            InlineKeyboardButton("💾 Guardar borrador", callback_data="FINAL_SAVE_DRAFT"),
+            InlineKeyboardButton("💾 Guardar como plantilla", callback_data="FINAL_SAVE_TEMPLATE"),
+            InlineKeyboardButton("❌ Cancelar borrador", callback_data="MENU_CANCEL_DRAFT"),
+        ],
+        [
             InlineKeyboardButton("🔙 Volver al menú", callback_data="BACK_TO_MENU"),
         ],
     ]
@@ -322,8 +354,103 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # --- Menú principal ---
     if data == "MENU_CREATE":
+        # Preguntar si usar plantilla si existen
+        templates = get_templates(user_id)
+        if templates:
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "✔ Sí, usar plantilla", callback_data="NEWPUB_USE_TEMPLATE"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️ No, escribir texto nuevo", callback_data="NEWPUB_NO_TEMPLATE"
+                    )
+                ],
+                [InlineKeyboardButton("❌ Cancelar", callback_data="BACK_TO_MENU")],
+            ]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="¿Quieres usar una plantilla de texto guardada?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        else:
+            context.user_data["state"] = "AWAITING_NEW_PUBLICATION_MESSAGE"
+            context.user_data["after_buttons_action"] = "FINAL_MENU"
+            context.user_data.pop("selected_template_text", None)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Envía ahora la publicación como si fueras a enviarla al canal "
+                    "(puede ser foto+texto, video+texto, nota de voz o solo texto)."
+                ),
+            )
+
+    elif data == "NEWPUB_USE_TEMPLATE":
+        templates = get_templates(user_id)
+        if not templates:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay plantillas guardadas.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+        else:
+            keyboard_rows: List[List[InlineKeyboardButton]] = []
+            for idx, tpl in enumerate(templates):
+                keyboard_rows.append(
+                    [
+                        InlineKeyboardButton(
+                            tpl["title"],
+                            callback_data=f"NEWPUB_TEMPLATE_{idx}",
+                        )
+                    ]
+                )
+            keyboard_rows.append(
+                [InlineKeyboardButton("⬅️ Volver", callback_data="MENU_CREATE")]
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Elige la plantilla que quieres usar:",
+                reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            )
+
+    elif data.startswith("NEWPUB_TEMPLATE_"):
+        # Elegir plantilla concreta y luego pedir media/publicación
+        try:
+            idx = int(data.split("_")[-1])
+        except ValueError:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Plantilla no válida.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+            return
+        templates = get_templates(user_id)
+        if idx < 0 or idx >= len(templates):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Plantilla no válida.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+            return
+
+        selected = templates[idx]
+        context.user_data["selected_template_text"] = selected["text"]
         context.user_data["state"] = "AWAITING_NEW_PUBLICATION_MESSAGE"
         context.user_data["after_buttons_action"] = "FINAL_MENU"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Envía ahora la publicación (foto, video, nota de voz o texto).\n"
+                "Se usará la plantilla seleccionada como texto de la publicación."
+            ),
+        )
+
+    elif data == "NEWPUB_NO_TEMPLATE":
+        context.user_data["state"] = "AWAITING_NEW_PUBLICATION_MESSAGE"
+        context.user_data["after_buttons_action"] = "FINAL_MENU"
+        context.user_data.pop("selected_template_text", None)
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -378,6 +505,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 text="✅ Publicación enviada al canal.",
             )
+            # Mostrar también cómo quedó al admin
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Así se publicó en el canal:",
+            )
+            await send_draft_preview(user_id, chat_id, context)
         await send_main_menu_simple(context, chat_id, user_id)
 
     elif data == "MENU_EDIT":
@@ -405,7 +538,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "💾 Guardar borrador como plantilla", callback_data="TEMPLATE_SAVE"
+                    "💾 Guardar texto actual como plantilla", callback_data="TEMPLATE_SAVE"
                 )
             ],
             [
@@ -413,7 +546,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     "📥 Insertar plantilla en borrador", callback_data="TEMPLATE_INSERT"
                 )
             ],
-            [InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU")],
+            [InlineKeyboardButton("❌ Cancelar y volver", callback_data="BACK_TO_MENU")],
         ]
         await context.bot.send_message(
             chat_id=chat_id,
@@ -463,13 +596,23 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["state"] = None
         context.user_data.pop("buttons_context", None)
         context.user_data.pop("after_buttons_action", None)
+        context.user_data.pop("selected_template_text", None)
         await send_main_menu_simple(context, chat_id, user_id)
 
-    elif data == "FINAL_SAVE_DRAFT":
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Borrador guardado.",
-        )
+    elif data == "FINAL_SAVE_TEMPLATE":
+        draft = get_draft(user_id)
+        text = (draft.get("text") or "").strip()
+        if not text:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="No hay texto en el borrador para guardar como plantilla.",
+            )
+        else:
+            title = save_template_from_text(user_id, text)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Plantilla guardada: {title}",
+            )
         await send_main_menu_simple(context, chat_id, user_id)
 
     # --- Flujo de botones después de nueva publicación ---
@@ -622,50 +765,89 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await _after_buttons_flow(user_id, chat_id, context)
 
-    # --- Plantillas ---
+    # --- Plantillas desde menú ---
     elif data == "TEMPLATE_SAVE":
         draft = get_draft(user_id)
-        if not draft.get("text"):
+        text = (draft.get("text") or "").strip()
+        if not text:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="No hay texto en el borrador para guardar como plantilla.",
             )
         else:
-            defaults = get_defaults(user_id)
-            defaults["template_text"] = draft["text"]
+            title = save_template_from_text(user_id, text)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="Plantilla guardada correctamente.",
+                text=f"Plantilla guardada: {title}",
             )
         await send_main_menu_simple(context, chat_id, user_id)
 
     elif data == "TEMPLATE_INSERT":
-        defaults = get_defaults(user_id)
-        template_text = defaults.get("template_text") or ""
-        if not template_text.strip():
+        templates = get_templates(user_id)
+        if not templates:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="No hay plantilla guardada para insertar.",
+                text="No hay plantillas guardadas para insertar.",
             )
             await send_main_menu_simple(context, chat_id, user_id)
         else:
-            draft = get_draft(user_id)
-            existing_text = draft.get("text") or ""
-            if not draft_has_content(draft):
-                draft["type"] = "text"
-                draft["file_id"] = None
-                draft["text"] = template_text
-            else:
-                if existing_text.strip():
-                    draft["text"] = existing_text + "\n\n" + template_text
-                else:
-                    draft["text"] = template_text
+            keyboard_rows: List[List[InlineKeyboardButton]] = []
+            for idx, tpl in enumerate(templates):
+                keyboard_rows.append(
+                    [
+                        InlineKeyboardButton(
+                            tpl["title"],
+                            callback_data=f"TEMPLATE_INSERT_PICK_{idx}",
+                        )
+                    ]
+                )
+            keyboard_rows.append(
+                [InlineKeyboardButton("⬅️ Volver al menú", callback_data="BACK_TO_MENU")]
+            )
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="Plantilla insertada en el borrador.",
+                text="Elige la plantilla que quieres insertar en el borrador:",
+                reply_markup=InlineKeyboardMarkup(keyboard_rows),
             )
-            await send_draft_preview(user_id, chat_id, context)
+
+    elif data.startswith("TEMPLATE_INSERT_PICK_"):
+        try:
+            idx = int(data.split("_")[-1])
+        except ValueError:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Plantilla no válida.",
+            )
             await send_main_menu_simple(context, chat_id, user_id)
+            return
+        templates = get_templates(user_id)
+        if idx < 0 or idx >= len(templates):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Plantilla no válida.",
+            )
+            await send_main_menu_simple(context, chat_id, user_id)
+            return
+
+        tpl = templates[idx]
+        draft = get_draft(user_id)
+        existing_text = draft.get("text") or ""
+        if not draft_has_content(draft):
+            draft["type"] = "text"
+            draft["file_id"] = None
+            draft["text"] = tpl["text"]
+        else:
+            if existing_text.strip():
+                draft["text"] = existing_text + "\n\n" + tpl["text"]
+            else:
+                draft["text"] = tpl["text"]
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Plantilla insertada en el borrador.",
+        )
+        await send_draft_preview(user_id, chat_id, context)
+        await send_main_menu_simple(context, chat_id, user_id)
 
     # --- Edición desde menú Editar ---
     elif data == "EDIT_TEXT":
@@ -811,9 +993,17 @@ async def handle_new_publication_message(
         )
         return
 
-    draft["type"] = content_type
-    draft["file_id"] = file_id
-    draft["text"] = text
+    selected_template = context.user_data.get("selected_template_text")
+    if selected_template:
+        # Usar solo el texto de la plantilla, pero respetar la media
+        draft["type"] = content_type
+        draft["file_id"] = file_id
+        draft["text"] = selected_template
+        context.user_data["selected_template_text"] = None
+    else:
+        draft["type"] = content_type
+        draft["file_id"] = file_id
+        draft["text"] = text
 
     context.user_data["state"] = None
 
@@ -913,7 +1103,7 @@ async def handle_schedule_datetime(
     text = message.text.strip()
 
     try:
-        scheduled_dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
+        scheduled_local = datetime.strptime(text, "%Y-%m-%d %H:%M")
     except ValueError:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -921,18 +1111,20 @@ async def handle_schedule_datetime(
         )
         return
 
-    now = datetime.now()
-    delta = (scheduled_dt - now).total_seconds()
+    # Ajuste a UTC asumiendo zona Colombia (UTC-5)
+    scheduled_utc = scheduled_local + timedelta(hours=5)
+    now_utc = datetime.utcnow()
+    delta = (scheduled_utc - now_utc).total_seconds()
 
-    # Permitimos pequeño margen; solo rechazamos claramente pasado más de 1 minuto
-    if delta <= -60:
+    # Permitimos programación solo si falta al menos 60 segundos
+    if delta <= 60:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="La fecha y hora deben ser futuras.",
+            text="La fecha y hora deben ser futuras (al menos 1 minuto desde ahora).",
         )
         return
 
-    delay = max(delta, 60.0)  # al menos 1 minuto
+    delay = delta
 
     if draft.get("job") is not None:
         try:
@@ -947,7 +1139,7 @@ async def handle_schedule_datetime(
         data={"user_id": user_id},
     )
 
-    draft["scheduled_at"] = scheduled_dt
+    draft["scheduled_at"] = scheduled_local  # guardamos hora local para mostrar
     draft["job"] = job
     context.user_data["state"] = None
 
@@ -955,7 +1147,7 @@ async def handle_schedule_datetime(
         chat_id=chat_id,
         text=(
             "✅ Publicación programada para "
-            f"{scheduled_dt.strftime('%Y-%m-%d %H:%M')}."
+            f"{scheduled_local.strftime('%Y-%m-%d %H:%M')}."
         ),
     )
 
@@ -1111,6 +1303,11 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
             chat_id=user_id,
             text="✅ Publicación programada enviada correctamente al canal.",
         )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="Así se publicó en el canal:",
+        )
+        await send_draft_preview(user_id, user_id, context)
     except Exception as exc:
         logging.error("Error enviando publicación programada: %s", exc)
 
