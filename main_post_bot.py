@@ -1,7 +1,7 @@
 import logging
 import os
 import copy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 
 from telegram import (
@@ -43,7 +43,6 @@ def init_user_structs(user_id: int) -> None:
             "templates": [],  # cada item: {"id": int, "title": str, "text": str}
         }
     else:
-        # migración simple si venía de versión anterior
         if "templates" not in DEFAULTS[user_id]:
             DEFAULTS[user_id]["templates"] = []
 
@@ -91,11 +90,31 @@ def is_admin_private(update: Update) -> bool:
 
 # --------- Plantillas ---------
 def _make_template_title(text: str, index: int) -> str:
+    """
+    Genera un título corto a partir del texto de la plantilla.
+    Regla: mantener emoji inicial (si lo hay) + primeras 5 palabras,
+    sin pasar de ~40 caracteres, sin cortar palabras.
+    """
     clean = " ".join(text.strip().split())
     if not clean:
         return f"Plantilla {index}"
+
     words = clean.split()
-    title = " ".join(words[:3])
+    # Tomar hasta 5 palabras
+    selected_words = words[:5]
+    title = " ".join(selected_words)
+    if len(title) > 40:
+        # Recortar respetando palabras
+        shortened = []
+        total = 0
+        for w in selected_words:
+            if total + len(w) + (1 if shortened else 0) > 40:
+                break
+            shortened.append(w)
+            total += len(w) + (1 if shortened else 0)
+        title = " ".join(shortened)
+    if len(words) > 5 or len(clean) > len(title):
+        title += "..."
     return title
 
 
@@ -416,7 +435,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
     elif data.startswith("NEWPUB_TEMPLATE_"):
-        # Elegir plantilla concreta y luego pedir media/publicación
         try:
             idx = int(data.split("_")[-1])
         except ValueError:
@@ -505,7 +523,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 text="✅ Publicación enviada al canal.",
             )
-            # Mostrar también cómo quedó al admin
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="Así se publicó en el canal:",
@@ -914,12 +931,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _after_buttons_flow(
     user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Flujo después de crear botones y contestar si se guardan como predeterminados."""
+    """Flujo después de crear o editar botones y contestar si se guardan como predeterminados."""
     context.user_data["state"] = None
     buttons_context = context.user_data.get("buttons_context")
     after_action = context.user_data.get("after_buttons_action")
 
-    # Vista previa solo una vez después de definir botones
     await send_draft_preview(user_id, chat_id, context)
 
     if after_action == "FINAL_MENU" or buttons_context in ("from_new", "from_edit_menu"):
@@ -995,7 +1011,6 @@ async def handle_new_publication_message(
 
     selected_template = context.user_data.get("selected_template_text")
     if selected_template:
-        # Usar solo el texto de la plantilla, pero respetar la media
         draft["type"] = content_type
         draft["file_id"] = file_id
         draft["text"] = selected_template
@@ -1012,7 +1027,6 @@ async def handle_new_publication_message(
         text="Publicación guardada en el borrador.",
     )
 
-    # Siempre vas a añadir botones: preguntar si usar predeterminados o crear nuevos
     defaults = get_defaults(user_id)
     if defaults.get("buttons"):
         keyboard = [
@@ -1111,12 +1125,14 @@ async def handle_schedule_datetime(
         )
         return
 
-    # Ajuste a UTC asumiendo zona Colombia (UTC-5)
-    scheduled_utc = scheduled_local + timedelta(hours=5)
-    now_utc = datetime.utcnow()
-    delta = (scheduled_utc - now_utc).total_seconds()
+    # Convertir hora local (UTC-5) a UTC real
+    local_tz = timezone(timedelta(hours=-5))
+    local_dt = scheduled_local.replace(tzinfo=local_tz)
+    utc_dt = local_dt.astimezone(timezone.utc)
 
-    # Permitimos programación solo si falta al menos 60 segundos
+    now_utc = datetime.now(timezone.utc)
+    delta = (utc_dt - now_utc).total_seconds()
+
     if delta <= 60:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1139,7 +1155,7 @@ async def handle_schedule_datetime(
         data={"user_id": user_id},
     )
 
-    draft["scheduled_at"] = scheduled_local  # guardamos hora local para mostrar
+    draft["scheduled_at"] = scheduled_local  # hora local para mostrar
     draft["job"] = job
     context.user_data["state"] = None
 
