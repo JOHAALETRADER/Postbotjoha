@@ -6,6 +6,8 @@ from typing import Dict, Any, Optional, List
 
 from telegram import (
     Update,
+    InputMediaPhoto,
+    InputMediaVideo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -21,6 +23,7 @@ from telegram.ext import (
 # Estructuras en memoria
 DRAFTS: Dict[int, Dict[str, Any]] = {}
 DEFAULTS: Dict[int, Dict[str, Any]] = {}
+PENDING_ALBUMS: Dict[int, Dict[str, Any]] = {}
 
 ADMIN_ID: int = 0
 TARGET_CHAT_ID: Any = None
@@ -229,94 +232,101 @@ async def send_main_menu_simple(
 
 
 # --------- Vista previa y envío ---------
-async def send_draft_preview(
-    user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+def get_media_items(draft: Dict[str, Any]) -> List[Dict[str, str]]:
+    if draft.get("media"):
+        return draft["media"]
+    if draft.get("type") in ("photo", "video", "voice") and draft.get("file_id"):
+        return [{"type": draft["type"], "file_id": draft["file_id"]}]
+    return []
+
+
+async def send_draft_content(draft, chat_id, context):
+    buttons = draft.get("buttons") or []
+    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    text = draft.get("text") or ""
+    media = get_media_items(draft)
+    if len(media) > 1:
+        # Telegram albums do not accept an inline keyboard. Keep the complete
+        # text and buttons together immediately below the album.
+        inputs = [
+            (InputMediaPhoto if item["type"] == "photo" else InputMediaVideo)(
+                media=item["file_id"]
+            ) for item in media
+        ]
+        messages = await context.bot.send_media_group(chat_id=chat_id, media=inputs)
+        if text or markup:
+            await send_publication_text(text or "🔗 Enlaces", chat_id, context, markup)
+        return messages[0]
+    if media:
+        item = media[0]
+        separate_text = len(text.encode("utf-16-le")) // 2 > 1024
+        sender = getattr(context.bot, "send_" + item["type"])
+        message = await sender(
+            chat_id=chat_id, **{item["type"]: item["file_id"]},
+            caption="" if separate_text else text,
+            reply_markup=None if separate_text else markup,
+        )
+        if separate_text:
+            await send_publication_text(text, chat_id, context, markup)
+        return message
+    return await send_publication_text(text or "(Publicación sin texto)", chat_id, context, markup)
+
+
+async def send_publication_text(text, chat_id, context, markup):
+    # Split at Telegram's UTF-16 message limit; keep buttons on the final part.
+    chunks, current, units = [], [], 0
+    for char in text:
+        size = 2 if ord(char) > 0xFFFF else 1
+        if units + size > 4096:
+            chunks.append("".join(current))
+            current, units = [], 0
+        current.append(char)
+        units += size
+    if current:
+        chunks.append("".join(current))
+    first = None
+    for index, chunk in enumerate(chunks):
+        message = await context.bot.send_message(
+            chat_id=chat_id, text=chunk,
+            reply_markup=markup if index == len(chunks) - 1 else None,
+        )
+        if first is None:
+            first = message
+    return first
+
+
+async def send_draft_preview(user_id, chat_id, context) -> None:
     draft = get_draft(user_id)
     if not draft_has_content(draft):
         await context.bot.send_message(chat_id=chat_id, text="(Sin publicación para vista previa)")
         return
-
-    buttons = draft.get("buttons") or []
-    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
-    text = draft.get("text") or ""
-    content_type = draft.get("type")
-    file_id = draft.get("file_id")
-
-    if content_type == "photo" and file_id:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=file_id,
-            caption=text,
-            reply_markup=reply_markup,
-        )
-    elif content_type == "video" and file_id:
-        await context.bot.send_video(
-            chat_id=chat_id,
-            video=file_id,
-            caption=text,
-            reply_markup=reply_markup,
-        )
-    elif content_type == "voice" and file_id:
-        await context.bot.send_voice(
-            chat_id=chat_id,
-            voice=file_id,
-            caption=text,
-            reply_markup=reply_markup,
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text if text else "(Publicación sin texto)",
-            reply_markup=reply_markup,
-        )
+    await send_draft_content(draft, chat_id, context)
 
 
-async def send_publication_to_target(
-    draft: Dict[str, Any],
-    context: ContextTypes.DEFAULT_TYPE,
-) -> Any:
+async def send_publication_to_target(draft, context):
     if not draft_has_content(draft):
         return None
+    return await send_draft_content(draft, TARGET_CHAT_ID, context)
 
-    buttons = draft.get("buttons") or []
-    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
-    text = draft.get("text") or ""
-    content_type = draft.get("type")
-    file_id = draft.get("file_id")
 
-    message = None
-
-    if content_type == "photo" and file_id:
-        message = await context.bot.send_photo(
-            chat_id=TARGET_CHAT_ID,
-            photo=file_id,
-            caption=text,
-            reply_markup=reply_markup,
-        )
-    elif content_type == "video" and file_id:
-        message = await context.bot.send_video(
-            chat_id=TARGET_CHAT_ID,
-            video=file_id,
-            caption=text,
-            reply_markup=reply_markup,
-        )
-    elif content_type == "voice" and file_id:
-        message = await context.bot.send_voice(
-            chat_id=TARGET_CHAT_ID,
-            voice=file_id,
-            caption=text,
-            reply_markup=reply_markup,
-        )
-    else:
-        message = await context.bot.send_message(
-            chat_id=TARGET_CHAT_ID,
-            text=text if text else "(Publicación sin texto)",
-            reply_markup=reply_markup,
-        )
-
-    return message
-
+async def finish_album(context):
+    user_id = context.job.data["user_id"]
+    pending = PENDING_ALBUMS.pop(user_id, None)
+    if pending is None:
+        return
+    updates = sorted(pending["updates"], key=lambda u: u.message.message_id)
+    first = updates[0]
+    messages = [u.message for u in updates]
+    context.user_data["received_album_media"] = [
+        {"type": "photo" if m.photo else "video",
+         "file_id": m.photo[-1].file_id if m.photo else m.video.file_id}
+        for m in messages
+    ]
+    context.user_data["received_album_caption"] = "\n\n".join(
+        m.caption for m in messages if m.caption
+    )
+    handler = handle_new_media if pending["state"] == "AWAITING_NEW_MEDIA" else handle_new_publication_message
+    await handler(first, context)
 
 
 # --------- Comandos ---------
@@ -345,6 +355,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id  # type: ignore[union-attr]
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
     data = query.data or ""
+    if user_id in PENDING_ALBUMS:
+        await context.bot.send_message(chat_id=chat_id, text="Estoy recibiendo el álbum; espera un momento y vuelve a pulsar la opción.")
+        return
+
 
     init_user_structs(user_id)
 
@@ -378,7 +392,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 text=(
                     "Envía ahora la publicación como si fueras a enviarla al canal "
-                    "(puede ser foto+texto, video+texto, nota de voz o solo texto)."
+                    "(puede ser un álbum de hasta 10 fotos/videos con texto, una foto, un video, nota de voz o solo texto)."
                 ),
             )
 
@@ -436,7 +450,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "Envía ahora la publicación (foto, video, nota de voz o texto).\n"
+                "Envía ahora la publicación (álbum de fotos/videos, foto, video, nota de voz o texto).\n"
                 "Se usará la plantilla seleccionada como texto de la publicación."
             ),
         )
@@ -449,7 +463,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             text=(
                 "Envía ahora la publicación como si fueras a enviarla al canal "
-                "(puede ser foto+texto, video+texto, nota de voz o solo texto)."
+                "(puede ser un álbum de hasta 10 fotos/videos con texto, una foto, un video, nota de voz o solo texto)."
             ),
         )
 
@@ -1076,7 +1090,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "Envía ahora la nueva media (foto, video o nota de voz).\n"
+                    "Envía ahora la nueva media (álbum de hasta 10 fotos/videos, foto, video o nota de voz).\n"
                     "Si no envías texto, se conservará el texto actual."
                 ),
             )
@@ -1169,6 +1183,11 @@ async def handle_new_publication_message(
             text="Tipo de mensaje no soportado. Envía foto, video, nota de voz o texto.",
         )
         return
+
+    draft["media"] = context.user_data.pop("received_album_media", [])
+    album_caption = context.user_data.pop("received_album_caption", None)
+    if album_caption is not None:
+        text = album_caption
 
     selected_template = context.user_data.get("selected_template_text")
     if selected_template:
@@ -1392,6 +1411,10 @@ async def handle_new_media(
 
     draft["type"] = content_type
     draft["file_id"] = file_id
+    draft["media"] = context.user_data.pop("received_album_media", [])
+    album_caption = context.user_data.pop("received_album_caption", None)
+    if album_caption is not None:
+        new_text = album_caption
 
     if new_text is not None and new_text.strip() != "":
         draft["text"] = new_text
@@ -1584,6 +1607,30 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     init_user_structs(user_id)
     state = context.user_data.get("state")
+
+    message = update.message
+    if message.media_group_id and (message.photo or message.video):
+        pending = PENDING_ALBUMS.get(user_id)
+        if pending is not None and pending["group_id"] != message.media_group_id:
+            await context.bot.send_message(chat_id=chat_id, text="Espera a que termine de recibirse el álbum actual.")
+            return
+        if pending is None:
+            if state not in ("AWAITING_NEW_PUBLICATION_MESSAGE", "AWAITING_NEW_MEDIA"):
+                await context.bot.send_message(chat_id=chat_id, text="Usa Crear / cambiar publicación o Cambiar media antes de enviar un álbum.")
+                return
+            pending = {"group_id": message.media_group_id, "state": state, "updates": [], "job": None}
+            PENDING_ALBUMS[user_id] = pending
+        if not any(u.message.message_id == message.message_id for u in pending["updates"]):
+            pending["updates"].append(update)
+        if pending["job"] is not None:
+            pending["job"].schedule_removal()
+        pending["job"] = context.application.job_queue.run_once(
+            finish_album, 2.0, data={"user_id": user_id}, user_id=user_id,
+        )
+        return
+    if user_id in PENDING_ALBUMS:
+        await context.bot.send_message(chat_id=chat_id, text="Espera a que termine de recibirse el álbum antes de continuar.")
+        return
 
     if state == "AWAITING_NEW_PUBLICATION_MESSAGE":
         await handle_new_publication_message(update, context)
