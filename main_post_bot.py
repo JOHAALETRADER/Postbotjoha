@@ -1660,12 +1660,232 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logging.error("Excepción en el manejador", exc_info=context.error)
 
 
+# --------- Educación automática: configuración y registro persistente ---------
+import asyncio
+import base64
+import io
+import json
+import sqlite3
+from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+
+EDU_TZ = timezone(timedelta(hours=-5))
+EDU_TOPICS = (
+    'gestión de riesgo', 'psicotrading', 'disciplina operativa',
+    'conceptos educativos de trading',
+)
+
+
+def edu_enabled():
+    return os.getenv('EDU_ENABLED', 'false').lower() in ('true', '1', 'yes')
+
+
+def edu_db():
+    root = Path(os.getenv('EDU_DATA_DIR', '/data/education'))
+    root.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(root / 'education.sqlite3'), timeout=30)
+    db.execute('''CREATE TABLE IF NOT EXISTS posts (
+        day TEXT PRIMARY KEY, status TEXT NOT NULL, attempts INTEGER DEFAULT 0,
+        title TEXT, caption TEXT, image BLOB, message_id INTEGER,
+        updated REAL NOT NULL, category TEXT)''')
+    db.commit()
+    return db
+
+
+def edu_get(day):
+    with edu_db() as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute('SELECT * FROM posts WHERE day=?', (day,)).fetchone()
+        return dict(row) if row else None
+
+
+def edu_claim(day):
+    now = datetime.now(timezone.utc).timestamp()
+    with edu_db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT status,attempts,updated FROM posts WHERE day=?', (day,)).fetchone()
+        if row:
+            status, attempts, updated = row
+            if status in ('ready', 'sending', 'sent', 'uncertain') or attempts >= 3:
+                return False
+            # Allow a bounded retry after API failure, or recover interrupted generation.
+            if now - updated < (900 if status == 'generating' else 300):
+                return False
+            db.execute("UPDATE posts SET status='generating', attempts=attempts+1, updated=? WHERE day=?", (now, day))
+        else:
+            db.execute("INSERT INTO posts(day,status,attempts,updated) VALUES (?,'generating',1,?)", (day, now))
+        return True
+
+
+def edu_api(endpoint, payload):
+    key = os.getenv('OPENAI_API_KEY', '').strip()
+    if not key:
+        raise RuntimeError('Falta OPENAI_API_KEY')
+    req = Request('https://api.openai.com/v1/' + endpoint,
+                  data=json.dumps(payload).encode('utf-8'),
+                  headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
+    try:
+        with urlopen(req, timeout=240) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        # Do not expose request headers, keys or provider response bodies in logs.
+        raise RuntimeError('OpenAI HTTP ' + str(exc.code)) from None
+    except Exception:
+        raise RuntimeError('No se pudo completar la conexión con OpenAI') from None
+
+
+def edu_generate(day):
+    with edu_db() as db:
+        history = db.execute("SELECT title,category FROM posts WHERE status='sent' ORDER BY day DESC LIMIT 60").fetchall()
+        count = db.execute("SELECT COUNT(*) FROM posts WHERE status='sent'").fetchone()[0]
+    category = EDU_TOPICS[count % len(EDU_TOPICS)]
+    instructions = '''Crea un miniartículo original en español para el canal de JOHAALETRADER,
+comunidad JT TRADERS TEAMS. Tutea, tono cercano, concreto y educativo.
+Devuelve JSON con title, body, image_prompt. Título máximo 60 caracteres;
+body entre 450 y 760 caracteres, con párrafos cortos, una idea útil explicada y
+un ejemplo cuando corresponda. Sin markdown, enlaces, hashtags ni firma.
+No inventes resultados, estadísticas, citas, noticias o experiencias personales.
+No recomiendes activos ni prometas ganancias. No presentes martingala como
+protección: aumenta exposición; las pérdidas acumuladas cuentan para el riesgo.
+Los ejemplos de riesgo deben ser matemáticamente correctos y distinguir tamaño
+de posición de pérdida máxima. Explica que la disciplina no garantiza ganancias.
+image_prompt: descripción visual coherente con el tema, sin cifras ni diagramas exactos.
+Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
+    for _ in range(2):
+        result = edu_api('chat/completions', {
+            'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
+            'messages': [{'role': 'system', 'content': instructions},
+                         {'role': 'user', 'content': json.dumps({'tema': category, 'fecha': day, 'historial': history}, ensure_ascii=False)}],
+            'response_format': {'type': 'json_object'}, 'max_tokens': 900,
+        })
+        article = json.loads(result['choices'][0]['message']['content'])
+        title = str(article.get('title', '')).strip()
+        body = str(article.get('body', '')).strip()
+        visual = str(article.get('image_prompt', '')).strip()
+        caption = title + '\n\n' + body + '\n\nJohanna Alegría | JOHAALETRADER'
+        # Telegram caption limit is counted conservatively in UTF-16 units.
+        if (title and body and visual and len(title) <= 60 and
+                450 <= len(body) <= 760 and len(caption.encode('utf-16-le')) // 2 <= 1024 and
+                title.casefold() not in [str(t).casefold() for t, _ in history]):
+            break
+    else:
+        raise RuntimeError('El artículo no cumplió los límites de formato')
+    style = os.getenv('EDU_IMAGE_STYLE',
+        'Diseño editorial elegante, negro, dorado oro brillante y acentos suaves violeta; '
+        'composición limpia, sin sobrecarga, sin personas ni rostros inventados. '
+        'Título corto legible en español y firma Johanna Alegría en dorado brillante abajo. '
+        'Marca JOHAALETRADER. Sin logos de brokers, sin resultados ni promesas de ganancias.')
+    generated = edu_api('images/generations', {
+        'model': os.getenv('EDU_IMAGE_MODEL', 'gpt-image-1'),
+        'prompt': style + '\nTítulo exacto: ' + title + '\nConcepto: ' + visual,
+        'size': '1024x1024', 'quality': 'medium', 'n': 1,
+    })
+    image = base64.b64decode(generated['data'][0]['b64_json'], validate=True)
+    if not image or len(image) > 10 * 1024 * 1024:
+        raise RuntimeError('Imagen vacía o demasiado grande para Telegram')
+    with edu_db() as db:
+        db.execute("UPDATE posts SET status='ready',title=?,caption=?,image=?,category=?,updated=? WHERE day=? AND status='generating'",
+                   (title, caption, image, category, datetime.now(timezone.utc).timestamp(), day))
+
+
+async def edu_alert(bot, text):
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=text)
+    except Exception:
+        logging.warning('No se pudo entregar el aviso educativo al administrador')
+
+
+async def education_tick(context):
+    now = datetime.now(EDU_TZ)
+    # Tuesday / Thursday / Saturday; prepare at 10:50 and send at 11:00.
+    if not edu_enabled() or now.weekday() not in (1, 3, 5):
+        return
+    minute = now.hour * 60 + now.minute
+    if not 650 <= minute < 690:  # catch up only until 11:30, never dump old posts
+        return
+    day = now.date().isoformat()
+    if edu_claim(day):
+        try:
+            await asyncio.to_thread(edu_generate, day)
+        except Exception as exc:
+            with edu_db() as db:
+                db.execute("UPDATE posts SET status='failed',updated=? WHERE day=? AND status='generating'",
+                           (datetime.now(timezone.utc).timestamp(), day))
+            logging.warning('Generación educativa fallida (%s)', type(exc).__name__)
+            await edu_alert(context.bot, '⚠️ No se pudo crear la publicación educativa. Se harán hasta 3 intentos. Revisa saldo, permisos de modelos y OPENAI_API_KEY en Railway.')
+            return
+    row = edu_get(day)
+    if not row or row['status'] != 'ready' or datetime.now(EDU_TZ).hour * 60 + datetime.now(EDU_TZ).minute < 660:
+        return
+    # Persist the claim BEFORE contacting Telegram; an ambiguous timeout is not retried.
+    with edu_db() as db:
+        claimed = db.execute("UPDATE posts SET status='sending',updated=? WHERE day=? AND status='ready'",
+                             (datetime.now(timezone.utc).timestamp(), day)).rowcount
+    if not claimed:
+        return
+    try:
+        photo = io.BytesIO(row['image'])
+        photo.name = 'educacion.png'
+        message = await context.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo,
+            caption=row['caption'], parse_mode=None, write_timeout=120, read_timeout=120)
+    except Exception:
+        with edu_db() as db:
+            db.execute("UPDATE posts SET status='uncertain' WHERE day=?", (day,))
+        await edu_alert(context.bot, '⚠️ El envío educativo no quedó confirmado. No se repetirá automáticamente para evitar duplicados. Revisa el canal y /educacion_estado.')
+        return
+    with edu_db() as db:
+        db.execute("UPDATE posts SET status='sent',message_id=?,image=NULL,updated=? WHERE day=?",
+                   (message.message_id, datetime.now(timezone.utc).timestamp(), day))
+    await edu_alert(context.bot, '✅ Publicación educativa enviada: ' + row['title'])
+
+
+async def education_status(update, context):
+    if not is_admin_private(update):
+        return
+    with edu_db() as db:
+        rows = db.execute('SELECT day,status,title FROM posts ORDER BY day DESC LIMIT 5').fetchall()
+    text = ('Educación automática: ' + ('ACTIVA' if edu_enabled() else 'INACTIVA') +
+            '\nMartes, jueves y sábados · 11:00 a. m. Colombia\n' +
+            '\n'.join(f'{d}: {s} — {t or "sin título"}' for d, s, t in rows))
+    await update.message.reply_text(text)
+
+
+async def education_preview(update, context):
+    if not is_admin_private(update):
+        return
+    row = edu_get(datetime.now(EDU_TZ).date().isoformat())
+    if row and row['status'] == 'ready' and row['image']:
+        await context.bot.send_photo(chat_id=ADMIN_ID, photo=io.BytesIO(row['image']), caption=row['caption'], parse_mode=None)
+    else:
+        await update.message.reply_text('No hay una publicación preparada pendiente. La preparación automática comienza a las 10:50 en los días establecidos.')
+
+
+async def education_startup(application):
+    if not edu_enabled():
+        return
+    if not os.getenv('OPENAI_API_KEY'):
+        await edu_alert(application.bot, '⚠️ Educación automática inactiva: falta OPENAI_API_KEY. El posteo manual sigue disponible.')
+        return
+    try:
+        edu_db().close()
+    except Exception:
+        await edu_alert(application.bot, '⚠️ No se pudo abrir el registro educativo. Revisa EDU_DATA_DIR y el volumen de Railway.')
+        return
+    application.job_queue.run_repeating(education_tick, interval=30, first=2,
+        name='education_automatic', job_kwargs={'max_instances': 1, 'coalesce': True})
+    logging.info('Educación automática preparada: mar/jue/sáb 11:00 Colombia')
+
+
 # --------- Main ---------
 def main() -> None:
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.INFO,
     )
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     token = os.getenv("BOT_TOKEN")
     admin_id_str = os.getenv("ADMIN_ID")
@@ -1684,9 +1904,11 @@ def main() -> None:
 
     TARGET_CHAT_ID = target_chat
 
-    application = ApplicationBuilder().token(token).build()
+    application = ApplicationBuilder().token(token).post_init(education_startup).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("educacion_estado", education_status))
+    application.add_handler(CommandHandler("educacion_vista", education_preview))
     application.add_handler(CallbackQueryHandler(on_button))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     application.add_error_handler(error_handler)
