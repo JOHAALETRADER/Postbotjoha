@@ -1764,8 +1764,8 @@ def edu_reference_image(payload):
 
 def edu_generate(day):
     with edu_db() as db:
-        history = db.execute("SELECT title,category FROM posts WHERE status='sent' ORDER BY day DESC LIMIT 60").fetchall()
-        count = db.execute("SELECT COUNT(*) FROM posts WHERE status='sent'").fetchone()[0]
+        history = db.execute("SELECT title,category FROM posts WHERE status='sent' AND day NOT LIKE 'greeting:%' ORDER BY day DESC LIMIT 60").fetchall()
+        count = db.execute("SELECT COUNT(*) FROM posts WHERE status='sent' AND day NOT LIKE 'greeting:%'").fetchone()[0]
     category = EDU_TOPICS[count % len(EDU_TOPICS)]
     instructions = '''Crea un miniartículo original en español para el canal de JOHAALETRADER,
 comunidad JT TRADERS TEAMS. Tutea, tono cercano, concreto y educativo.
@@ -1889,9 +1889,11 @@ async def education_status(update, context):
     if not is_admin_private(update):
         return
     with edu_db() as db:
-        rows = db.execute('SELECT day,status,title FROM posts ORDER BY day DESC LIMIT 5').fetchall()
+        rows = db.execute('SELECT day,status,title FROM posts ORDER BY updated DESC LIMIT 8').fetchall()
     text = ('Educación automática: ' + ('ACTIVA' if edu_enabled() else 'INACTIVA') +
-            '\nMartes, jueves y sábados · 11:00 a. m. Colombia\n' +
+            '\nArtículos: martes, jueves y sábados · 11:00 a. m. Colombia\n' +
+            'Saludos: ' + ('ACTIVOS' if greeting_enabled() and edu_enabled() else 'INACTIVOS') +
+            '\nLunes a sábado 9:00 a. m. · Domingo 10:00 a. m. Colombia\n' +
             '\n'.join(f'{d}: {s} — {t or "sin título"}' for d, s, t in rows))
     await update.message.reply_text(text)
 
@@ -1904,6 +1906,106 @@ async def education_preview(update, context):
         await context.bot.send_photo(chat_id=ADMIN_ID, photo=io.BytesIO(row['image']), caption=row['caption'], parse_mode=None)
     else:
         await update.message.reply_text('No hay una publicación preparada pendiente. La preparación automática comienza a las 10:50 en los días establecidos.')
+
+
+# --------- Saludos diarios automáticos ---------
+def greeting_enabled():
+    return os.getenv('GREETING_ENABLED', 'true').lower() in ('true', '1', 'yes')
+
+
+def greeting_generate(key, sunday):
+    with edu_db() as db:
+        history = db.execute("SELECT caption FROM posts WHERE day LIKE 'greeting:%' AND status='sent' ORDER BY updated DESC LIMIT 60").fetchall()
+    theme = ('Saludo dominical: agradecer la semana, bendiciones, aprendizajes y esperanza; '
+             'prepararse con buena actitud para la semana que comienza mañana. '
+             'No presupongas que todo salió bien ni inventes resultados de la comunidad.' if sunday else
+             'Buenos días: energía positiva, calma, gratitud y motivación para disfrutar el día.')
+    instruction = ('Escribe para JT TRADERS TEAMS en español, tuteando y SIN asignar género a quien lee. '
+        'Tono muy positivo, motivador, cálido y natural. Nada de miedo, culpa ni promesas financieras. '
+        'Mensaje breve de 180 a 380 caracteres, 2 párrafos cortos y máximo 2 emojis. '
+        'Termina con una invitación sencilla y positiva para el día. Sin ventas ni llamados a depositar u operar. '
+        'No inventes citas ni experiencias personales. Sin markdown, enlaces, hashtags ni firma. '
+        'Devuelve JSON con title (máximo 45 caracteres), body e image_prompt. '
+        'image_prompt describe un paisaje luminoso, amanecer, naturaleza o escena de buenos días '
+        'acorde al mensaje, sin personas. Varía paisajes y enfoques frente al historial.')
+    for _ in range(2):
+        response = edu_api('chat/completions', {
+            'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
+            'messages': [{'role': 'system', 'content': instruction},
+                         {'role': 'user', 'content': json.dumps({'tema': theme, 'historial': history}, ensure_ascii=False)}],
+            'response_format': {'type': 'json_object'}, 'max_tokens': 600})
+        obj = json.loads(response['choices'][0]['message']['content'])
+        title = str(obj.get('title', '')).strip()
+        body = str(obj.get('body', '')).strip()
+        visual = str(obj.get('image_prompt', '')).strip()
+        caption = title + '\n\n' + body + '\n\nJohanna Alegría | JOHAALETRADER'
+        if (title and len(title) <= 45 and 180 <= len(body) <= 380 and visual and
+                len(caption.encode('utf-16-le')) // 2 <= 1024 and
+                all(body.casefold() not in c.casefold() for (c,) in history)):
+            break
+    else:
+        raise RuntimeError('Saludo fuera de los límites de formato')
+    generated = edu_reference_image({
+        'model': os.getenv('EDU_IMAGE_MODEL', 'gpt-image-1'),
+        'prompt': ('Crea una imagen NUEVA luminosa y motivadora para un saludo de buenos días. '
+            'Paisaje natural alusivo al mensaje. Morado y luz dorada con detalles negros discretos; '
+            'no oscurezcas el paisaje, sin sobrecarga ni lujo excesivo. '
+            'La referencia adjunta sirve SOLO para la firma manuscrita dorada Johanna Alegría '
+            'y la marca JOHAALETRADER al pie. No reproduzcas la persona ni el escenario de trading. '
+            'Elimina todos los textos y avisos de live de la referencia. Sin personas ni gráficos financieros. '
+            'Incluye solamente el título nuevo y la firma con marca. Texto neutro en género. '
+            '\nTítulo: ' + title + '\nEscena: ' + visual),
+        'size': '1024x1024', 'quality': 'medium', 'n': 1, 'input_fidelity': 'high'})
+    image = base64.b64decode(generated['data'][0]['b64_json'], validate=True)
+    if not image or len(image) > 10 * 1024 * 1024:
+        raise RuntimeError('Imagen de saludo inválida')
+    with edu_db() as db:
+        db.execute("UPDATE posts SET status='ready',title=?,caption=?,image=?,category=?,updated=? WHERE day=? AND status='generating'",
+                   (title, caption, image, 'domingo' if sunday else 'buenos días', datetime.now(timezone.utc).timestamp(), key))
+
+
+async def greeting_tick(context):
+    if not edu_enabled() or not greeting_enabled():
+        return
+    now = datetime.now(EDU_TZ)
+    sunday = now.weekday() == 6
+    target = 600 if sunday else 540
+    minute = now.hour * 60 + now.minute
+    if not target - 10 <= minute < target + 30:
+        return
+    key = 'greeting:' + now.date().isoformat()
+    if edu_claim(key):
+        try:
+            await asyncio.to_thread(greeting_generate, key, sunday)
+        except Exception as exc:
+            with edu_db() as db:
+                db.execute("UPDATE posts SET status='failed',updated=? WHERE day=? AND status='generating'",
+                           (datetime.now(timezone.utc).timestamp(), key))
+            logging.warning('Generación de saludo fallida (%s)', type(exc).__name__)
+            await edu_alert(context.bot, '⚠️ No se pudo crear el saludo. Hasta 3 intentos; revisa saldo, API y referencia.')
+            return
+    now = datetime.now(EDU_TZ)
+    row = edu_get(key)
+    if not row or row['status'] != 'ready' or not target <= now.hour * 60 + now.minute < target + 30:
+        return
+    with edu_db() as db:
+        claimed = db.execute("UPDATE posts SET status='sending',updated=? WHERE day=? AND status='ready'",
+                             (datetime.now(timezone.utc).timestamp(), key)).rowcount
+    if not claimed:
+        return
+    try:
+        photo = io.BytesIO(row['image']); photo.name = 'saludo.png'
+        message = await context.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo,
+            caption=row['caption'], parse_mode=None, write_timeout=120, read_timeout=120)
+    except Exception:
+        with edu_db() as db:
+            db.execute("UPDATE posts SET status='uncertain' WHERE day=?", (key,))
+        await edu_alert(context.bot, '⚠️ El saludo no quedó confirmado. No se repetirá automáticamente para evitar duplicados; revisa el canal.')
+        return
+    with edu_db() as db:
+        db.execute("UPDATE posts SET status='sent',message_id=?,image=NULL,updated=? WHERE day=?",
+                   (message.message_id, datetime.now(timezone.utc).timestamp(), key))
+    await edu_alert(context.bot, '✅ Saludo automático enviado: ' + row['title'])
 
 
 async def education_startup(application):
@@ -1919,7 +2021,10 @@ async def education_startup(application):
         return
     application.job_queue.run_repeating(education_tick, interval=30, first=2,
         name='education_automatic', job_kwargs={'max_instances': 1, 'coalesce': True})
-    logging.info('Educación automática preparada: mar/jue/sáb 11:00 Colombia')
+    if greeting_enabled():
+        application.job_queue.run_repeating(greeting_tick, interval=30, first=3,
+            name='greetings_automatic', job_kwargs={'max_instances': 1, 'coalesce': True})
+    logging.info('Educación mar/jue/sáb 11:00; saludos lun-sáb 09:00 y domingo 10:00 Colombia')
 
 
 # --------- Main ---------
