@@ -1735,6 +1735,33 @@ def edu_api(endpoint, payload):
         raise RuntimeError('No se pudo completar la conexión con OpenAI') from None
 
 
+def edu_reference_image(payload):
+    # Reference stays as a separate repository asset, never embedded in code.
+    import uuid
+    reference = Path(os.getenv('EDU_REFERENCE_IMAGE', str(Path(__file__).resolve().parent / 'assets' / 'education_reference.png')))
+    if not reference.is_file():
+        raise RuntimeError('Falta assets/education_reference.png')
+    data = reference.read_bytes()
+    if not data.startswith(b'\x89PNG\r\n\x1a\n') or len(data) > 25 * 1024 * 1024:
+        raise RuntimeError('Referencia PNG inválida o demasiado grande')
+    boundary = 'edu_' + uuid.uuid4().hex
+    parts = []
+    for field, value in payload.items():
+        parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="' + field + '"\r\n\r\n' + str(value) + '\r\n').encode())
+    parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="image"; filename="reference.png"\r\nContent-Type: image/png\r\n\r\n').encode() + data + b'\r\n')
+    parts.append(('--' + boundary + '--\r\n').encode())
+    req = Request('https://api.openai.com/v1/images/edits', data=b''.join(parts),
+        headers={'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY'],
+                 'Content-Type': 'multipart/form-data; boundary=' + boundary})
+    try:
+        with urlopen(req, timeout=240) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        raise RuntimeError('OpenAI imágenes HTTP ' + str(exc.code)) from None
+    except Exception:
+        raise RuntimeError('No se pudo completar la edición con referencia') from None
+
+
 def edu_generate(day):
     with edu_db() as db:
         history = db.execute("SELECT title,category FROM posts WHERE status='sent' ORDER BY day DESC LIMIT 60").fetchall()
@@ -1742,6 +1769,12 @@ def edu_generate(day):
     category = EDU_TOPICS[count % len(EDU_TOPICS)]
     instructions = '''Crea un miniartículo original en español para el canal de JOHAALETRADER,
 comunidad JT TRADERS TEAMS. Tutea, tono cercano, concreto y educativo.
+Lenguaje totalmente neutro respecto al género de quien lee: evita adjetivos o
+sustantivos que asignen género; usa tú, quien opera, la comunidad y expresiones neutras.
+Tono siempre positivo, motivador, constructivo y realista, sin culpabilizar ni alarmar.
+Termina body con un llamado a la acción educativo específico: revisar el plan,
+registrar una emoción, definir un límite o guardar el aprendizaje. No incites a
+operar, depositar o recuperar pérdidas. El llamado cuenta dentro del límite de body.
 Devuelve JSON con title, body, image_prompt. Título máximo 60 caracteres;
 body entre 450 y 760 caracteres, con párrafos cortos, una idea útil explicada y
 un ejemplo cuando corresponda. Sin markdown, enlaces, hashtags ni firma.
@@ -1772,14 +1805,26 @@ Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
     else:
         raise RuntimeError('El artículo no cumplió los límites de formato')
     style = os.getenv('EDU_IMAGE_STYLE',
-        'Diseño editorial elegante, negro, dorado oro brillante y acentos suaves violeta; '
-        'composición limpia, sin sobrecarga, sin personas ni rostros inventados. '
-        'Título corto legible en español y firma Johanna Alegría en dorado brillante abajo. '
-        'Marca JOHAALETRADER. Sin logos de brokers, sin resultados ni promesas de ganancias.')
-    generated = edu_api('images/generations', {
+        'Crea una imagen educativa NUEVA acorde al concepto del artículo. '
+        'La imagen adjunta es SOLO referencia de la firma manuscrita Johanna Alegría '
+        'y de la marca JOHAALETRADER: no es una plantilla de composición ni de persona. '
+        'NO reproduzcas el rostro, cuerpo, cabello, vestuario o pose de la persona adjunta. '
+        'La escena principal debe representar el aprendizaje del artículo mediante objetos, '
+        'ambientes o metáforas visuales claras y variadas; no incluyas personas. '
+        'Paleta morado, negro y dorado oro brillante. Estilo moderno, cercano, positivo '
+        'y motivador, limpio, sin lujo excesivo ni sobrecarga. '
+        'Conserva visualmente la firma manuscrita dorada de la parte inferior de la '
+        'referencia y el nombre JOHAALETRADER; no inventes otra caligrafía. '
+        'Elimina TODOS los anuncios, textos y rótulos de la referencia: LIVE HOY, '
+        'EN LA TARDE, CRIPTO Y PARES DE DIVISAS, EN VIVO. No anuncies un live. '
+        'Solo incluye el título educativo nuevo y la firma con la marca abajo. '
+        'Sin cifras, gráficos de datos exactos, resultados ficticios ni promesas de ganancias. '
+        'Cualquier texto dirigido al público debe ser neutro respecto al género.')
+    generated = edu_reference_image({
         'model': os.getenv('EDU_IMAGE_MODEL', 'gpt-image-1'),
         'prompt': style + '\nTítulo exacto: ' + title + '\nConcepto: ' + visual,
         'size': '1024x1024', 'quality': 'medium', 'n': 1,
+        'input_fidelity': 'high',
     })
     image = base64.b64decode(generated['data'][0]['b64_json'], validate=True)
     if not image or len(image) > 10 * 1024 * 1024:
@@ -1813,7 +1858,7 @@ async def education_tick(context):
                 db.execute("UPDATE posts SET status='failed',updated=? WHERE day=? AND status='generating'",
                            (datetime.now(timezone.utc).timestamp(), day))
             logging.warning('Generación educativa fallida (%s)', type(exc).__name__)
-            await edu_alert(context.bot, '⚠️ No se pudo crear la publicación educativa. Se harán hasta 3 intentos. Revisa saldo, permisos de modelos y OPENAI_API_KEY en Railway.')
+            await edu_alert(context.bot, '⚠️ No se pudo crear la publicación educativa. Se harán hasta 3 intentos. Revisa saldo, permisos de modelos, OPENAI_API_KEY y assets/education_reference.png.')
             return
     row = edu_get(day)
     if not row or row['status'] != 'ready' or datetime.now(EDU_TZ).hour * 60 + datetime.now(EDU_TZ).minute < 660:
