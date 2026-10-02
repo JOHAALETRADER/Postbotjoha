@@ -1689,6 +1689,11 @@ def edu_db():
         day TEXT PRIMARY KEY, status TEXT NOT NULL, attempts INTEGER DEFAULT 0,
         title TEXT, caption TEXT, image BLOB, message_id INTEGER,
         updated REAL NOT NULL, category TEXT)''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(posts)')}
+    if 'publish_kind' not in columns:
+        db.execute("ALTER TABLE posts ADD COLUMN publish_kind TEXT DEFAULT 'article'")
+    if 'payload' not in columns:
+        db.execute('ALTER TABLE posts ADD COLUMN payload TEXT')
     db.commit()
     return db
 
@@ -1762,10 +1767,10 @@ def edu_reference_image(payload):
         raise RuntimeError('No se pudo completar la edición con referencia') from None
 
 
-def edu_generate(day):
+def edu_generate_article(day):
     with edu_db() as db:
-        history = db.execute("SELECT title,category FROM posts WHERE status='sent' AND day NOT LIKE 'greeting:%' ORDER BY day DESC LIMIT 60").fetchall()
-        count = db.execute("SELECT COUNT(*) FROM posts WHERE status='sent' AND day NOT LIKE 'greeting:%'").fetchone()[0]
+        history = db.execute("SELECT title,category FROM posts WHERE status='sent' AND day NOT LIKE 'greeting:%' AND publish_kind='article' ORDER BY day DESC LIMIT 60").fetchall()
+        count = db.execute("SELECT COUNT(*) FROM posts WHERE status='sent' AND day NOT LIKE 'greeting:%' AND publish_kind='article'").fetchone()[0]
     category = EDU_TOPICS[count % len(EDU_TOPICS)]
     instructions = '''Crea un miniartículo original en español para el canal de JOHAALETRADER,
 comunidad JT TRADERS TEAMS. Tutea, tono cercano, concreto y educativo.
@@ -1785,6 +1790,8 @@ Los ejemplos de riesgo deben ser matemáticamente correctos y distinguir tamaño
 de posición de pérdida máxima. Explica que la disciplina no garantiza ganancias.
 image_prompt: descripción visual coherente con el tema, sin cifras ni diagramas exactos.
 Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
+    if count % 2 == 0:
+        instructions += '\nTermina body con una pregunta breve y concreta sobre el tema que invite a reflexionar o comentar. Inclúyela dentro de los 760 caracteres; no asumas que hay comentarios habilitados.'
     for _ in range(2):
         result = edu_api('chat/completions', {
             'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
@@ -1830,7 +1837,7 @@ Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
     if not image or len(image) > 10 * 1024 * 1024:
         raise RuntimeError('Imagen vacía o demasiado grande para Telegram')
     with edu_db() as db:
-        db.execute("UPDATE posts SET status='ready',title=?,caption=?,image=?,category=?,updated=? WHERE day=? AND status='generating'",
+        db.execute("UPDATE posts SET status='ready',publish_kind='article',title=?,caption=?,image=?,category=?,updated=? WHERE day=? AND status='generating'",
                    (title, caption, image, category, datetime.now(timezone.utc).timestamp(), day))
 
 
@@ -1839,6 +1846,138 @@ async def edu_alert(bot, text):
         await bot.send_message(chat_id=ADMIN_ID, text=text)
     except Exception:
         logging.warning('No se pudo entregar el aviso educativo al administrador')
+
+
+# --------- Interacción semanal y resumen mensual ---------
+def education_kind(day):
+    date = datetime.strptime(day, '%Y-%m-%d')
+    if date.weekday() == 5:
+        return 'poll'
+    if date.weekday() == 1 and date.day <= 7:
+        return 'summary'
+    return 'article'
+
+
+def previous_month_articles(day):
+    date = datetime.strptime(day, '%Y-%m-%d')
+    first = date.replace(day=1)
+    start = (first - timedelta(days=1)).replace(day=1).date().isoformat()
+    end = first.date().isoformat()
+    with edu_db() as db:
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute(
+            "SELECT day,title,caption,message_id FROM posts WHERE day>=? AND day<? "
+            "AND status='sent' AND publish_kind='article' AND message_id IS NOT NULL ORDER BY day", (start, end))]
+
+
+def save_interaction(day, kind, title, payload):
+    with edu_db() as db:
+        db.execute("UPDATE posts SET status='ready',publish_kind=?,title=?,payload=?,image=NULL,updated=? "
+                   "WHERE day=? AND status='generating'",
+                   (kind, title, json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).timestamp(), day))
+
+
+def generate_poll(day):
+    with edu_db() as db:
+        previous = db.execute("SELECT title FROM posts WHERE publish_kind='poll' AND status='sent' ORDER BY day DESC LIMIT 20").fetchall()
+    for _ in range(2):
+        result = edu_api('chat/completions', {
+            'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
+            'messages': [{'role': 'system', 'content':
+                'Crea una encuesta de opinión para JT TRADERS TEAMS, en español, tuteando, '
+                'totalmente neutra en género, positiva y motivadora. Pregunta sobre hábitos, '
+                'disciplina, emociones o temas educativos que interesa aprender. No es un examen '
+                'ni tiene respuesta correcta. Sin promesas, resultados inventados o ventas. '
+                'Devuelve JSON: question de máximo 220 caracteres y options con 3 o 4 opciones '
+                'distintas de máximo 80 caracteres, claras y mutuamente diferenciadas. Sin markdown. '
+                'No repitas preguntas del historial.'},
+                {'role': 'user', 'content': json.dumps({'fecha': day, 'historial': previous}, ensure_ascii=False)}],
+            'response_format': {'type': 'json_object'}, 'max_tokens': 500})
+        obj = json.loads(result['choices'][0]['message']['content'])
+        q = obj.get('question'); options = obj.get('options')
+        if (isinstance(q, str) and 5 <= len(q) <= 220 and isinstance(options, list) and
+                3 <= len(options) <= 4 and all(isinstance(o, str) and 1 <= len(o.strip()) <= 80 for o in options) and
+                len({o.strip().casefold() for o in options}) == len(options) and
+                q.casefold() not in [str(t).casefold() for (t,) in previous]):
+            save_interaction(day, 'poll', q, {'question': q, 'options': [o.strip() for o in options]})
+            return
+    raise RuntimeError('Encuesta fuera de formato')
+
+
+def generate_summary(day, sources):
+    # Only confirmed published articles are provided, never greetings or invented links.
+    result = edu_api('chat/completions', {
+        'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
+        'messages': [{'role': 'system', 'content':
+            'Resume los aprendizajes de los artículos recibidos. Español, tuteo, sin género, '
+            'positivo, motivador y fiel al contenido. No inventes resultados ni hechos. '
+            'Devuelve JSON con intro (máximo 220 caracteres), closing (máximo 130 caracteres, '
+            'llamado a aplicar un aprendizaje) y lessons: lista de objetos con day y learning '
+            '(máximo 100 caracteres). Una lección por cada artículo; no inventes fechas ni enlaces.'},
+            {'role': 'user', 'content': json.dumps(sources, ensure_ascii=False)}],
+        'response_format': {'type': 'json_object'}, 'max_tokens': 1600})
+    obj = json.loads(result['choices'][0]['message']['content'])
+    lessons = obj.get('lessons', [])
+    if not isinstance(lessons, list):
+        raise RuntimeError('Resumen inválido')
+    by_date = {x.get('day'): str(x.get('learning', '')).strip() for x in lessons if isinstance(x, dict)}
+    if set(by_date) != {x['day'] for x in sources} or any(not v or len(v) > 100 for v in by_date.values()):
+        raise RuntimeError('Resumen no corresponde a los artículos publicados')
+    intro = str(obj.get('intro', '')).strip(); closing = str(obj.get('closing', '')).strip()
+    if not intro or len(intro) > 220 or not closing or len(closing) > 130:
+        raise RuntimeError('Resumen demasiado largo')
+    for item in sources:
+        item['learning'] = by_date[item['day']]
+    month = sources[0]['day'][:7]
+    save_interaction(day, 'summary', 'Aprendizajes del mes · ' + month,
+                     {'intro': intro, 'closing': closing, 'sources': sources})
+
+
+def edu_generate(day):
+    kind = education_kind(day)
+    if kind == 'poll':
+        generate_poll(day)
+    elif kind == 'summary':
+        sources = previous_month_articles(day)
+        if sources:
+            generate_summary(day, sources)
+        else:
+            # First month: keep an educational article rather than fabricate a recap.
+            edu_generate_article(day)
+    else:
+        edu_generate_article(day)
+
+
+async def send_education_content(bot, row, chat_id):
+    kind = row['publish_kind'] or 'article'
+    if kind == 'poll':
+        payload = json.loads(row['payload'])
+        return await bot.send_poll(chat_id=chat_id, question=payload['question'], options=payload['options'],
+                                   is_anonymous=True, allows_multiple_answers=False, type='regular', read_timeout=120)
+    if kind == 'summary':
+        import html
+        payload = json.loads(row['payload'])
+        chat = await bot.get_chat(TARGET_CHAT_ID)
+        if chat.username:
+            base = 'https://t.me/' + chat.username
+        elif str(chat.id).startswith('-100'):
+            base = 'https://t.me/c/' + str(chat.id)[4:]
+        else:
+            raise RuntimeError('No se pudo construir el enlace al canal')
+        pieces = [html.escape(row['title']), '', html.escape(payload['intro']), '']
+        for source in payload['sources']:
+            # URLs are derived from Telegram IDs, never supplied by the text model.
+            url = base + '/' + str(int(source['message_id']))
+            pieces.append('• <a href="' + url + '">' + html.escape(source['title'][:60]) + '</a>\n' + html.escape(source['learning']))
+        pieces += ['', html.escape(payload['closing']), '', 'Johanna Alegría | JOHAALETRADER']
+        text = '\n'.join(pieces)
+        # Telegram counts visible text; this conservative bound includes markup too.
+        if len(text.encode('utf-16-le')) // 2 > 4096:
+            raise RuntimeError('Resumen excede el límite de Telegram')
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', disable_web_page_preview=True, read_timeout=120)
+    photo = io.BytesIO(row['image']); photo.name = 'educacion.png'
+    return await bot.send_photo(chat_id=chat_id, photo=photo, caption=row['caption'],
+                               parse_mode=None, write_timeout=120, read_timeout=120)
 
 
 async def education_tick(context):
@@ -1861,7 +2000,8 @@ async def education_tick(context):
             await edu_alert(context.bot, '⚠️ No se pudo crear la publicación educativa. Se harán hasta 3 intentos. Revisa saldo, permisos de modelos, OPENAI_API_KEY y assets/education_reference.png.')
             return
     row = edu_get(day)
-    if not row or row['status'] != 'ready' or datetime.now(EDU_TZ).hour * 60 + datetime.now(EDU_TZ).minute < 660:
+    current = datetime.now(EDU_TZ)
+    if not row or row['status'] != 'ready' or not 660 <= current.hour * 60 + current.minute < 690:
         return
     # Persist the claim BEFORE contacting Telegram; an ambiguous timeout is not retried.
     with edu_db() as db:
@@ -1870,10 +2010,7 @@ async def education_tick(context):
     if not claimed:
         return
     try:
-        photo = io.BytesIO(row['image'])
-        photo.name = 'educacion.png'
-        message = await context.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo,
-            caption=row['caption'], parse_mode=None, write_timeout=120, read_timeout=120)
+        message = await send_education_content(context.bot, row, TARGET_CHAT_ID)
     except Exception:
         with edu_db() as db:
             db.execute("UPDATE posts SET status='uncertain' WHERE day=?", (day,))
@@ -1891,7 +2028,7 @@ async def education_status(update, context):
     with edu_db() as db:
         rows = db.execute('SELECT day,status,title FROM posts ORDER BY updated DESC LIMIT 8').fetchall()
     text = ('Educación automática: ' + ('ACTIVA' if edu_enabled() else 'INACTIVA') +
-            '\nArtículos: martes, jueves y sábados · 11:00 a. m. Colombia\n' +
+            '\nArtículos: martes y jueves · 11:00 a. m. Colombia\nEncuesta: sábado · 11:00 a. m.\nResumen: primer martes del mes · 11:00 a. m. (reemplaza artículo)\n' +
             'Saludos: ' + ('ACTIVOS' if greeting_enabled() and edu_enabled() else 'INACTIVOS') +
             '\nLunes a sábado 9:00 a. m. · Domingo 10:00 a. m. Colombia\n' +
             '\n'.join(f'{d}: {s} — {t or "sin título"}' for d, s, t in rows))
@@ -1902,8 +2039,8 @@ async def education_preview(update, context):
     if not is_admin_private(update):
         return
     row = edu_get(datetime.now(EDU_TZ).date().isoformat())
-    if row and row['status'] == 'ready' and row['image']:
-        await context.bot.send_photo(chat_id=ADMIN_ID, photo=io.BytesIO(row['image']), caption=row['caption'], parse_mode=None)
+    if row and row['status'] == 'ready':
+        await send_education_content(context.bot, row, ADMIN_ID)
     else:
         await update.message.reply_text('No hay una publicación preparada pendiente. La preparación automática comienza a las 10:50 en los días establecidos.')
 
@@ -2024,7 +2161,7 @@ async def education_startup(application):
     if greeting_enabled():
         application.job_queue.run_repeating(greeting_tick, interval=30, first=3,
             name='greetings_automatic', job_kwargs={'max_instances': 1, 'coalesce': True})
-    logging.info('Educación mar/jue/sáb 11:00; saludos lun-sáb 09:00 y domingo 10:00 Colombia')
+    logging.info('Artículos mar/jue, encuesta sáb, resumen primer martes 11:00; saludos lun-sáb 09:00 y domingo 10:00 Colombia')
 
 
 # --------- Main ---------
