@@ -1741,6 +1741,24 @@ def edu_api(endpoint, payload):
 
 
 def edu_reference_image(payload):
+    # Shared composition rule for articles and greetings, including custom styles.
+    payload = dict(payload)
+    payload['prompt'] = payload.get('prompt', '') + (
+        '\nCOMPOSICIÓN OBLIGATORIA PARA FIRMA Y MARCA: imagen cuadrada 1024x1024. '
+        'Reserva una zona limpia para la firma y JOHAALETRADER entre el 72% y el 88% '
+        'de la altura. Centra horizontalmente el bloque completo y limita su ancho '
+        'al 40% del lienzo como MÁXIMO (410 píxeles), con un ancho objetivo de 32%. '
+        'El bloque de firma y marca debe ser discreto: altura máxima 8% del lienzo '
+        '(82 píxeles). No lo amplíes para llenar la zona reservada; el paisaje y '
+        'el título son los protagonistas. TODOS los trazos, adornos, brillos y letras deben quedar '
+        'dentro de esa zona. Deja al menos 12% de margen inferior (123 píxeles) y '
+        '12% a cada lado. La firma COMPLETA debe leerse Johanna Alegría, con '
+        'JOHAALETRADER completo debajo; reduce el tamaño del bloque si hace falta. '
+        'No coloques nada de la firma en el borde, fuera del lienzo ni parcialmente '
+        'oculto. El paisaje debe continuar debajo de la firma hasta el borde inferior. '
+        'No copies la ubicación inferior de la firma en la referencia. '
+        'Preserva su estilo manuscrito dorado, con contraste suficiente para leerlo.'
+    )
     # Reference stays as a separate repository asset, never embedded in code.
     import uuid
     reference = Path(os.getenv('EDU_REFERENCE_IMAGE', str(Path(__file__).resolve().parent / 'assets' / 'education_reference.png')))
