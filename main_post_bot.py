@@ -1740,49 +1740,55 @@ def edu_api(endpoint, payload):
         raise RuntimeError('No se pudo completar la conexión con OpenAI') from None
 
 
+def edu_signature_path():
+    return Path(os.getenv('EDU_SIGNATURE_IMAGE', str(Path(__file__).resolve().parent / 'assets' / 'brand_signature.png')))
+
+
+def edu_apply_signature(image_bytes):
+    # Fixed PNG: spelling and handwriting never depend on image generation.
+    from PIL import Image
+    import io
+    signature_path = edu_signature_path()
+    if not signature_path.is_file():
+        raise RuntimeError('Falta assets/brand_signature.png')
+    with Image.open(signature_path) as source:
+        if source.mode != 'RGBA' or source.getextrema()[3][0] == 255:
+            raise RuntimeError('La firma debe ser un PNG con transparencia')
+        signature = source.copy()
+    bounds = signature.getchannel('A').getbbox()
+    if not bounds:
+        raise RuntimeError('La firma está vacía')
+    signature = signature.crop(bounds)
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        canvas = source.convert('RGBA')
+    width, height = canvas.size
+    scale = min(width * 0.35 / signature.width, height * 0.10 / signature.height)
+    signature = signature.resize((max(1, round(signature.width * scale)),
+                                  max(1, round(signature.height * scale))), Image.Resampling.LANCZOS)
+    x = (width - signature.width) // 2
+    y = height - round(height * 0.12) - signature.height
+    canvas.alpha_composite(signature, (x, y))
+    output = io.BytesIO()
+    canvas.convert('RGB').save(output, format='JPEG', quality=95)
+    return output.getvalue()
+
+
 def edu_reference_image(payload):
-    # Shared composition rule for articles and greetings, including custom styles.
+    # Keep the shared call interface; generate backgrounds without branding.
+    # Validate the asset before paying for image generation.
+    if not edu_signature_path().is_file():
+        raise RuntimeError('Falta assets/brand_signature.png')
     payload = dict(payload)
+    payload.pop('input_fidelity', None)
     payload['prompt'] = payload.get('prompt', '') + (
-        '\nCOMPOSICIÓN OBLIGATORIA PARA FIRMA Y MARCA: imagen cuadrada 1024x1024. '
-        'Reserva una zona limpia para la firma y JOHAALETRADER entre el 72% y el 88% '
-        'de la altura. Centra horizontalmente el bloque completo y limita su ancho '
-        'al 40% del lienzo como MÁXIMO (410 píxeles), con un ancho objetivo de 32%. '
-        'El bloque de firma y marca debe ser discreto: altura máxima 8% del lienzo '
-        '(82 píxeles). No lo amplíes para llenar la zona reservada; el paisaje y '
-        'el título son los protagonistas. TODOS los trazos, adornos, brillos y letras deben quedar '
-        'dentro de esa zona. Deja al menos 12% de margen inferior (123 píxeles) y '
-        '12% a cada lado. La firma COMPLETA debe leerse Johanna Alegría, con '
-        'JOHAALETRADER completo debajo; reduce el tamaño del bloque si hace falta. '
-        'No coloques nada de la firma en el borde, fuera del lienzo ni parcialmente '
-        'oculto. El paisaje debe continuar debajo de la firma hasta el borde inferior. '
-        'No copies la ubicación inferior de la firma en la referencia. '
-        'Preserva su estilo manuscrito dorado, con contraste suficiente para leerlo.'
+        '\nREGLA FINAL OBLIGATORIA: incluye únicamente el título solicitado. '
+        'NO dibujes firmas, nombres de marca, logotipos, marcas de agua ni letras adicionales. '
+        'Ignora cualquier instrucción anterior que pida una firma o marca. '
+        'Mantén el título por encima del 65% de la altura. Entre el 72% y el 88% '
+        'deja un fondo tranquilo y oscuro, sin texto ni objetos importantes, para añadir '
+        'después una firma dorada desde un archivo. El paisaje continúa hasta el borde.'
     )
-    # Reference stays as a separate repository asset, never embedded in code.
-    import uuid
-    reference = Path(os.getenv('EDU_REFERENCE_IMAGE', str(Path(__file__).resolve().parent / 'assets' / 'education_reference.png')))
-    if not reference.is_file():
-        raise RuntimeError('Falta assets/education_reference.png')
-    data = reference.read_bytes()
-    if not data.startswith(b'\x89PNG\r\n\x1a\n') or len(data) > 25 * 1024 * 1024:
-        raise RuntimeError('Referencia PNG inválida o demasiado grande')
-    boundary = 'edu_' + uuid.uuid4().hex
-    parts = []
-    for field, value in payload.items():
-        parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="' + field + '"\r\n\r\n' + str(value) + '\r\n').encode())
-    parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="image"; filename="reference.png"\r\nContent-Type: image/png\r\n\r\n').encode() + data + b'\r\n')
-    parts.append(('--' + boundary + '--\r\n').encode())
-    req = Request('https://api.openai.com/v1/images/edits', data=b''.join(parts),
-        headers={'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY'],
-                 'Content-Type': 'multipart/form-data; boundary=' + boundary})
-    try:
-        with urlopen(req, timeout=240) as response:
-            return json.load(response)
-    except HTTPError as exc:
-        raise RuntimeError('OpenAI imágenes HTTP ' + str(exc.code)) from None
-    except Exception:
-        raise RuntimeError('No se pudo completar la edición con referencia') from None
+    return edu_api('images/generations', payload)
 
 
 def edu_generate_article(day):
@@ -1831,27 +1837,19 @@ Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
         raise RuntimeError('El artículo no cumplió los límites de formato')
     style = os.getenv('EDU_IMAGE_STYLE',
         'Crea una imagen educativa NUEVA acorde al concepto del artículo. '
-        'La imagen adjunta es SOLO referencia de la firma manuscrita Johanna Alegría '
-        'y de la marca JOHAALETRADER: no es una plantilla de composición ni de persona. '
-        'NO reproduzcas el rostro, cuerpo, cabello, vestuario o pose de la persona adjunta. '
-        'La escena principal debe representar el aprendizaje del artículo mediante objetos, '
-        'ambientes o metáforas visuales claras y variadas; no incluyas personas. '
-        'Paleta morado, negro y dorado oro brillante. Estilo moderno, cercano, positivo '
-        'y motivador, limpio, sin lujo excesivo ni sobrecarga. '
-        'Conserva visualmente la firma manuscrita dorada de la parte inferior de la '
-        'referencia y el nombre JOHAALETRADER; no inventes otra caligrafía. '
-        'Elimina TODOS los anuncios, textos y rótulos de la referencia: LIVE HOY, '
-        'EN LA TARDE, CRIPTO Y PARES DE DIVISAS, EN VIVO. No anuncies un live. '
-        'Solo incluye el título educativo nuevo y la firma con la marca abajo. '
-        'Sin cifras, gráficos de datos exactos, resultados ficticios ni promesas de ganancias. '
-        'Cualquier texto dirigido al público debe ser neutro respecto al género.')
+        'Representa el aprendizaje con objetos, ambientes o metáforas claras y variadas. '
+        'No incluyas personas. Paleta morado, negro y dorado oro brillante. '
+        'Estilo moderno, cercano, positivo, limpio, sin lujo excesivo ni sobrecarga. '
+        'Incluye únicamente el título educativo. Sin firmas ni marcas. '
+        'Sin cifras, gráficos exactos, resultados ficticios ni promesas de ganancias. '
+        'Texto neutro respecto al género.')
     generated = edu_reference_image({
         'model': os.getenv('EDU_IMAGE_MODEL', 'gpt-image-1'),
         'prompt': style + '\nTítulo exacto: ' + title + '\nConcepto: ' + visual,
         'size': '1024x1024', 'quality': 'medium', 'n': 1,
         'input_fidelity': 'high',
     })
-    image = base64.b64decode(generated['data'][0]['b64_json'], validate=True)
+    image = edu_apply_signature(base64.b64decode(generated['data'][0]['b64_json'], validate=True))
     if not image or len(image) > 10 * 1024 * 1024:
         raise RuntimeError('Imagen vacía o demasiado grande para Telegram')
     with edu_db() as db:
@@ -2105,13 +2103,11 @@ def greeting_generate(key, sunday):
         'prompt': ('Crea una imagen NUEVA luminosa y motivadora para un saludo de buenos días. '
             'Paisaje natural alusivo al mensaje. Morado y luz dorada con detalles negros discretos; '
             'no oscurezcas el paisaje, sin sobrecarga ni lujo excesivo. '
-            'La referencia adjunta sirve SOLO para la firma manuscrita dorada Johanna Alegría '
-            'y la marca JOHAALETRADER al pie. No reproduzcas la persona ni el escenario de trading. '
-            'Elimina todos los textos y avisos de live de la referencia. Sin personas ni gráficos financieros. '
-            'Incluye solamente el título nuevo y la firma con marca. Texto neutro en género. '
+            'Sin personas ni gráficos financieros, firmas ni marcas. '
+            'Incluye solamente el título nuevo. Texto neutro en género. '
             '\nTítulo: ' + title + '\nEscena: ' + visual),
         'size': '1024x1024', 'quality': 'medium', 'n': 1, 'input_fidelity': 'high'})
-    image = base64.b64decode(generated['data'][0]['b64_json'], validate=True)
+    image = edu_apply_signature(base64.b64decode(generated['data'][0]['b64_json'], validate=True))
     if not image or len(image) > 10 * 1024 * 1024:
         raise RuntimeError('Imagen de saludo inválida')
     with edu_db() as db:
