@@ -1783,6 +1783,21 @@ def edu_reference_image(payload):
     payload = dict(payload)
     payload.pop('input_fidelity', None)
     payload['prompt'] = payload.get('prompt', '') + (
+        '\nDIRECCIÓN VISUAL FINAL OBLIGATORIA: fotografía editorial realista, nivel profesional. '
+        'Usa una única escena principal coherente, luz natural o de estudio creíble, '
+        'materiales y texturas reales, perspectiva y profundidad de campo naturales. '
+        'Estética de la referencia: negro profundo, morado intenso, oro metálico brillante, '
+        'texturas reales nítidas, reflejos controlados y profundidad cinematográfica. '
+        'Composición limpia y profesional, sin saturación ni exceso de elementos. '
+        'Para educación, objetos reales o espacios reales que transmitan el concepto; '
+        'para saludos, paisaje fotográfico luminoso. No llenes la escena de símbolos. '
+        'PROHIBIDO: caricaturas, dibujos infantiles, ilustración vectorial o plana, '
+        'clipart, iconos gigantes, bombillas simbólicas, flechas y curvas flotantes, '
+        'collage de objetos, render plástico, fantasía, halos de neón o humo sobre el texto. '
+        'Título grande y legible con alto contraste, letras gruesas nítidas, '
+        'combinando oro metálico y blanco como en la referencia, '
+        'máximo tres líneas y sin efecto transparente ni dorado sobre fondo dorado. '
+        'Estas reglas prevalecen sobre cualquier descripción visual anterior. '
         '\nREGLA FINAL OBLIGATORIA: incluye únicamente el título solicitado. '
         'NO dibujes firmas, nombres de marca, logotipos, marcas de agua ni letras adicionales. '
         'Ignora cualquier instrucción anterior que pida una firma o marca. '
@@ -1790,7 +1805,54 @@ def edu_reference_image(payload):
         'deja un fondo tranquilo y oscuro, sin texto ni objetos importantes, para añadir '
         'después una firma dorada desde un archivo. El paisaje continúa hasta el borde.'
     )
-    return edu_api('images/generations', payload)
+    reference = Path(os.getenv('EDU_STYLE_REFERENCE_IMAGE',
+        str(Path(__file__).resolve().parent / 'assets' / 'style_reference.png')))
+    if not reference.is_file():
+        # Preserve image generation if the asset hasn't been uploaded yet.
+        logging.warning('Falta assets/style_reference.png; se usa la dirección fotográfica sin referencia')
+        return edu_api('images/generations', payload)
+    payload['prompt'] += (
+        '\nLa imagen adjunta es EXCLUSIVAMENTE una referencia de estética y calidad: '
+        'crea una escena NUEVA acorde al tema solicitado. No copies el cuaderno, escritorio, '
+        'pantalla ni objetos cuando no correspondan al tema. Para saludos conserva el paisaje '
+        'luminoso y adapta la paleta con naturalidad. No copies el título original, la palabra '
+        'PLAN, los gráficos, la firma ni la marca de la referencia. El único texto es el título '
+        'nuevo solicitado. No reproduzcas una firma: se añadirá después desde el PNG fijo. '
+        'Mantén la zona inferior reservada limpia, sin ningún trazo ni letra.'
+    )
+    return edu_style_edit(payload, reference)
+
+
+def edu_style_edit(payload, reference):
+    # Multipart upload uses the official image-edit endpoint, no additional dependency.
+    import uuid
+    key = os.getenv('OPENAI_API_KEY', '').strip()
+    if not key:
+        raise RuntimeError('Falta OPENAI_API_KEY')
+    data = reference.read_bytes()
+    if not data.startswith(b'\x89PNG\r\n\x1a\n') or len(data) > 25 * 1024 * 1024:
+        raise RuntimeError('Referencia de estilo PNG inválida o demasiado grande')
+    fields = dict(payload)
+    if fields.get('model') in ('gpt-image-1', 'gpt-image-1.5'):
+        fields['input_fidelity'] = 'high'
+    boundary = 'style_' + uuid.uuid4().hex
+    parts = []
+    for field, value in fields.items():
+        parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="' +
+                      field + '"\r\n\r\n' + str(value) + '\r\n').encode('utf-8'))
+    parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="image"; '
+                  'filename="style_reference.png"\r\nContent-Type: image/png\r\n\r\n').encode() + data + b'\r\n')
+    parts.append(('--' + boundary + '--\r\n').encode())
+    request = Request('https://api.openai.com/v1/images/edits', data=b''.join(parts),
+                      headers={'Authorization': 'Bearer ' + key,
+                               'Content-Type': 'multipart/form-data; boundary=' + boundary})
+    try:
+        with urlopen(request, timeout=240) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        raise RuntimeError('OpenAI HTTP ' + str(exc.code)) from None
+    except Exception:
+        raise RuntimeError('No se pudo completar la conexión con OpenAI') from None
 
 
 def edu_safe_error(exc):
@@ -1799,6 +1861,7 @@ def edu_safe_error(exc):
     allowed = (
         'Falta OPENAI_API_KEY', 'Falta assets/brand_signature.png',
         'La firma debe ser un PNG con transparencia', 'La firma está vacía',
+        'Referencia de estilo PNG inválida o demasiado grande',
         'No se pudo completar la conexión con OpenAI',
         'El artículo no cumplió los límites de formato', 'Encuesta fuera de formato',
         'Resumen inválido', 'Resumen no corresponde a los artículos publicados',
@@ -1880,7 +1943,7 @@ Termina body con un llamado a la acción educativo específico: revisar el plan,
 registrar una emoción, definir un límite o guardar el aprendizaje. No incites a
 operar, depositar o recuperar pérdidas. El llamado cuenta dentro del límite de body.
 Devuelve JSON con title, body, image_prompt. Título máximo 60 caracteres;
-body entre 450 y 760 caracteres, con párrafos cortos, una idea útil explicada y
+body entre 450 y 650 caracteres en TOTAL, incluyendo espacios y saltos de línea, con párrafos cortos, una idea útil explicada y
 un ejemplo cuando corresponda. Sin markdown, enlaces, hashtags ni firma.
 No inventes resultados, estadísticas, citas, noticias o experiencias personales.
 No recomiendes activos ni prometas ganancias. No presentes martingala como
@@ -1890,7 +1953,9 @@ de posición de pérdida máxima. Explica que la disciplina no garantiza gananci
 image_prompt: descripción visual coherente con el tema, sin cifras ni diagramas exactos.
 Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
     if count % 2 == 0:
-        instructions += '\nTermina body con una pregunta breve y concreta sobre el tema que invite a reflexionar o comentar. Inclúyela dentro de los 760 caracteres; no asumas que hay comentarios habilitados.'
+        instructions += '\nTermina body con una pregunta breve y concreta sobre el tema que invite a reflexionar o comentar. Inclúyela dentro de los 650 caracteres; no asumas que hay comentarios habilitados.'
+    messages = [{'role': 'system', 'content': instructions},
+                {'role': 'user', 'content': json.dumps({'tema': category, 'fecha': day, 'historial': history}, ensure_ascii=False)}]
     repair = ''
     article = None
     api_failed = False
@@ -1898,32 +1963,44 @@ Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
         try:
             result = edu_api('chat/completions', {
                 'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
-                'messages': [{'role': 'system', 'content': instructions + repair},
-                             {'role': 'user', 'content': json.dumps({'tema': category, 'fecha': day, 'historial': history}, ensure_ascii=False)}],
+                'messages': messages,
                 'response_format': {'type': 'json_object'}, 'max_tokens': 1300,
             })
-            obj = json.loads(result['choices'][0]['message']['content'])
+            raw_content = result['choices'][0]['message']['content']
+            messages.append({'role': 'assistant', 'content': raw_content})
+            obj = json.loads(raw_content)
+            if not isinstance(obj, dict):
+                raise ValueError('Respuesta JSON inválida')
             title = obj.get('title', ''); body = obj.get('body', ''); visual = obj.get('image_prompt', '')
             if not all(isinstance(v, str) for v in (title, body, visual)):
                 raise ValueError('Campos de texto inválidos')
             title, body, visual = title.strip(), body.strip(), visual.strip()
+            if not visual:
+                visual = 'Fotografía editorial de un espacio sereno de planificación, coherente con: ' + title
             caption = title + '\n\n' + body + '\n\nJohanna Alegría | JOHAALETRADER'
-            # 450–760 remains the writing target. A useful shorter article is valid.
+            # 450–650 remains the writing target. A useful shorter article is valid.
             if (title and len(title) <= 60 and 180 <= len(body) <= 760 and visual and
                     len(caption.encode('utf-16-le')) // 2 <= 1024 and
                     title.casefold() not in [str(t).casefold() for t, _ in history]):
                 article = (title, body, visual, caption)
                 break
+            logging.warning('Formato artículo [%s] intento %s: título=%s, cuerpo=%s, caption_utf16=%s, título_repetido=%s',
+                            day, attempt + 1, len(title), len(body),
+                            len(caption.encode('utf-16-le')) // 2,
+                            title.casefold() in [str(t).casefold() for t, _ in history])
             repair = ('\nCORRECCIÓN DEL INTENTO ANTERIOR: title tuvo ' + str(len(title)) +
                       ' caracteres y body ' + str(len(body)) + '. Usa un título NUEVO de hasta 60 '
                       'caracteres, body de 450 a 650 y image_prompt no vacío. '
                       'Acorta sin cortar frases; conserva la idea, el ejemplo y el llamado a la acción.')
+            messages.append({'role': 'user', 'content': repair})
         except RuntimeError as exc:
             edu_record_error(day, 'texto', exc)
             api_failed = True
             break  # Quota/auth/connectivity: use the local educational backup.
         except (ValueError, KeyError, IndexError, TypeError) as exc:
+            logging.warning('Formato artículo [%s] intento %s: estructura JSON inválida (%s)', day, attempt + 1, type(exc).__name__)
             repair = '\nCORRECCIÓN: entrega JSON válido con title, body e image_prompt como texto.'
+            messages.append({'role': 'user', 'content': repair})
     if article is None:
         if not api_failed:
             edu_record_error(day, 'formato del artículo', RuntimeError('El artículo no cumplió los límites de formato'))
@@ -2171,6 +2248,32 @@ async def education_run(context, recover=False):
     await edu_alert(context.bot, notice)
 
 
+async def education_test(update, context):
+    # Preview only: a separate temporary record cannot replace the scheduled article.
+    if not is_admin_private(update):
+        return
+    import uuid
+    key = 'preview:' + datetime.now(EDU_TZ).date().isoformat() + ':' + uuid.uuid4().hex[:8]
+    await update.message.reply_text('Estoy preparando una muestra de artículo e imagen. La recibirás aquí; no se publicará en el canal.')
+    try:
+        if not edu_claim(key):
+            return
+        await asyncio.to_thread(edu_generate_article, key)
+        row = edu_get(key)
+        if not row or row['status'] != 'ready':
+            raise RuntimeError('No se pudo preparar la muestra')
+        await send_education_content(context.bot, row, ADMIN_ID)
+        if row.get('last_error'):
+            await update.message.reply_text('La muestra usó respaldo: ' + row['last_error'])
+        else:
+            await update.message.reply_text('Muestra creada con contenido nuevo de la IA y firma fija. La programación del canal sigue igual.')
+    except Exception as exc:
+        await update.message.reply_text('No se pudo completar la prueba: ' + edu_safe_error(exc))
+    finally:
+        with edu_db() as db:
+            db.execute("DELETE FROM posts WHERE day=? AND day LIKE 'preview:%'", (key,))
+
+
 async def education_retry(update, context):
     # Explicit recovery only for TODAY. The persistent send claim still prevents duplicates.
     if not is_admin_private(update):
@@ -2364,6 +2467,7 @@ def main() -> None:
     application.add_handler(CommandHandler("educacion_estado", education_status))
     application.add_handler(CommandHandler("educacion_vista", education_preview))
     application.add_handler(CommandHandler("educacion_reintentar", education_retry))
+    application.add_handler(CommandHandler("educacion_prueba", education_test))
     application.add_handler(CallbackQueryHandler(on_button))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     application.add_error_handler(error_handler)
