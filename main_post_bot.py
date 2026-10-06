@@ -1694,6 +1694,8 @@ def edu_db():
         db.execute("ALTER TABLE posts ADD COLUMN publish_kind TEXT DEFAULT 'article'")
     if 'payload' not in columns:
         db.execute('ALTER TABLE posts ADD COLUMN payload TEXT')
+    if 'last_error' not in columns:
+        db.execute('ALTER TABLE posts ADD COLUMN last_error TEXT')
     db.commit()
     return db
 
@@ -1791,6 +1793,79 @@ def edu_reference_image(payload):
     return edu_api('images/generations', payload)
 
 
+def edu_safe_error(exc):
+    # Only our own fixed error messages are exposed; never provider bodies/headers.
+    message = str(exc)
+    allowed = (
+        'Falta OPENAI_API_KEY', 'Falta assets/brand_signature.png',
+        'La firma debe ser un PNG con transparencia', 'La firma está vacía',
+        'No se pudo completar la conexión con OpenAI',
+        'El artículo no cumplió los límites de formato', 'Encuesta fuera de formato',
+        'Resumen inválido', 'Resumen no corresponde a los artículos publicados',
+        'Resumen demasiado largo', 'Imagen vacía o demasiado grande para Telegram',
+    )
+    if message in allowed:
+        return message
+    if message.startswith('OpenAI HTTP ') and message[12:].isdigit():
+        return message
+    return type(exc).__name__
+
+
+def edu_record_error(day, stage, exc):
+    detail = stage + ': ' + edu_safe_error(exc)
+    logging.warning('Educación automática [%s] %s', day, detail)
+    with edu_db() as db:
+        db.execute('UPDATE posts SET last_error=? WHERE day=?', (detail, day))
+
+
+def edu_backup_article(day, category):
+    # Reviewed local content: no external API is needed to keep the educational slot.
+    lessons = {
+        'gestión de riesgo': (
+            'Define tu límite antes de empezar',
+            'La gestión de riesgo empieza antes de cualquier entrada. Decide cuánto puedes perder '
+            'en una operación y cuál será el límite de la sesión. Esos límites ayudan a cuidar tu '
+            'capital y a tomar decisiones con calma.\n\nSi tu capital es de 100 USD y defines una '
+            'pérdida máxima del 1%, el límite es 1 USD. La cantidad que inviertes y la pérdida posible '
+            'no siempre son iguales: dependen del instrumento y sus condiciones.\n\nHoy revisa tus '
+            'límites y déjalos por escrito. ¿Qué regla te ayudará a respetarlos?',
+            'Una libreta con un plan junto a una brújula, metáfora de límites y dirección'),
+        'psicotrading': (
+            'Una pausa también es una decisión',
+            'Reconocer lo que sientes te ayuda a decidir con más claridad. Antes de una entrada, '
+            'haz una pausa y observa si estás siguiendo tu plan o reaccionando a una emoción. '
+            'La calma se practica con hábitos pequeños.\n\nDespués de una pérdida, evita buscar '
+            'una entrada solo para compensarla. Respira, revisa el contexto y recuerda tus límites. '
+            'No necesitas resolver todo en una sola sesión.\n\nHoy registra una emoción y cómo '
+            'influyó en una decisión. ¿Qué pausa puedes incorporar a tu rutina?',
+            'Un lago tranquilo al amanecer y una libreta, metáfora de claridad emocional'),
+        'disciplina operativa': (
+            'Convierte tu plan en un hábito',
+            'La disciplina crece cuando tu plan se vuelve fácil de consultar. Una lista breve '
+            'puede ayudarte: contexto claro, condición de entrada, riesgo definido y límite de '
+            'sesión. Revisa cada punto antes de decidir.\n\nSi falta una condición, esperar también '
+            'forma parte del proceso. Seguir un plan no garantiza ganancias, pero te permite '
+            'evaluar decisiones con criterios consistentes.\n\nHoy elige una regla y registra '
+            'si la respetaste. ¿Qué hábito quieres fortalecer en tu próxima sesión?',
+            'Una agenda ordenada junto a un reloj, metáfora de constancia y planificación'),
+        'conceptos educativos de trading': (
+            'Observa el contexto de cada nivel',
+            'Un soporte o una resistencia es una zona de interés, no una garantía de giro. '
+            'Observa cómo llega el precio, qué reacción aparece y qué condiciones exige tu plan '
+            'antes de tomar una decisión.\n\nEl mismo nivel puede mostrar respuestas diferentes '
+            'según el contexto. Evita interpretar un solo toque como confirmación suficiente y '
+            'mantén definidos tus límites de riesgo.\n\nHoy marca una zona y describe lo que '
+            'observas sin anticipar el resultado. ¿Qué señal de contexto revisarás primero?',
+            'Un camino con puntos de observación, metáfora de contexto y zonas de interés'),
+    }
+    title, body, visual = lessons[category]
+    with edu_db() as db:
+        exists = db.execute("SELECT 1 FROM posts WHERE status='sent' AND title=?", (title,)).fetchone()
+    if exists:
+        title += ' · ' + day[5:]
+    return title, body, visual
+
+
 def edu_generate_article(day):
     with edu_db() as db:
         history = db.execute("SELECT title,category FROM posts WHERE status='sent' AND day NOT LIKE 'greeting:%' AND publish_kind='article' ORDER BY day DESC LIMIT 60").fetchall()
@@ -1816,25 +1891,51 @@ image_prompt: descripción visual coherente con el tema, sin cifras ni diagramas
 Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
     if count % 2 == 0:
         instructions += '\nTermina body con una pregunta breve y concreta sobre el tema que invite a reflexionar o comentar. Inclúyela dentro de los 760 caracteres; no asumas que hay comentarios habilitados.'
-    for _ in range(2):
-        result = edu_api('chat/completions', {
-            'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
-            'messages': [{'role': 'system', 'content': instructions},
-                         {'role': 'user', 'content': json.dumps({'tema': category, 'fecha': day, 'historial': history}, ensure_ascii=False)}],
-            'response_format': {'type': 'json_object'}, 'max_tokens': 900,
-        })
-        article = json.loads(result['choices'][0]['message']['content'])
-        title = str(article.get('title', '')).strip()
-        body = str(article.get('body', '')).strip()
-        visual = str(article.get('image_prompt', '')).strip()
+    repair = ''
+    article = None
+    api_failed = False
+    for attempt in range(3):
+        try:
+            result = edu_api('chat/completions', {
+                'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
+                'messages': [{'role': 'system', 'content': instructions + repair},
+                             {'role': 'user', 'content': json.dumps({'tema': category, 'fecha': day, 'historial': history}, ensure_ascii=False)}],
+                'response_format': {'type': 'json_object'}, 'max_tokens': 1300,
+            })
+            obj = json.loads(result['choices'][0]['message']['content'])
+            title = obj.get('title', ''); body = obj.get('body', ''); visual = obj.get('image_prompt', '')
+            if not all(isinstance(v, str) for v in (title, body, visual)):
+                raise ValueError('Campos de texto inválidos')
+            title, body, visual = title.strip(), body.strip(), visual.strip()
+            caption = title + '\n\n' + body + '\n\nJohanna Alegría | JOHAALETRADER'
+            # 450–760 remains the writing target. A useful shorter article is valid.
+            if (title and len(title) <= 60 and 180 <= len(body) <= 760 and visual and
+                    len(caption.encode('utf-16-le')) // 2 <= 1024 and
+                    title.casefold() not in [str(t).casefold() for t, _ in history]):
+                article = (title, body, visual, caption)
+                break
+            repair = ('\nCORRECCIÓN DEL INTENTO ANTERIOR: title tuvo ' + str(len(title)) +
+                      ' caracteres y body ' + str(len(body)) + '. Usa un título NUEVO de hasta 60 '
+                      'caracteres, body de 450 a 650 y image_prompt no vacío. '
+                      'Acorta sin cortar frases; conserva la idea, el ejemplo y el llamado a la acción.')
+        except RuntimeError as exc:
+            edu_record_error(day, 'texto', exc)
+            api_failed = True
+            break  # Quota/auth/connectivity: use the local educational backup.
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            repair = '\nCORRECCIÓN: entrega JSON válido con title, body e image_prompt como texto.'
+    if article is None:
+        if not api_failed:
+            edu_record_error(day, 'formato del artículo', RuntimeError('El artículo no cumplió los límites de formato'))
+        title, body, visual = edu_backup_article(day, category)
         caption = title + '\n\n' + body + '\n\nJohanna Alegría | JOHAALETRADER'
-        # Telegram caption limit is counted conservatively in UTF-16 units.
-        if (title and body and visual and len(title) <= 60 and
-                450 <= len(body) <= 760 and len(caption.encode('utf-16-le')) // 2 <= 1024 and
-                title.casefold() not in [str(t).casefold() for t, _ in history]):
-            break
     else:
-        raise RuntimeError('El artículo no cumplió los límites de formato')
+        title, body, visual, caption = article
+    # Save usable text BEFORE requesting the image; image failure cannot discard it.
+    with edu_db() as db:
+        db.execute("UPDATE posts SET publish_kind='article',title=?,caption=?,category=?,payload=NULL,updated=? "
+                   "WHERE day=? AND status='generating'",
+                   (title, caption, category, datetime.now(timezone.utc).timestamp(), day))
     style = os.getenv('EDU_IMAGE_STYLE',
         'Crea una imagen educativa NUEVA acorde al concepto del artículo. '
         'Representa el aprendizaje con objetos, ambientes o metáforas claras y variadas. '
@@ -1843,18 +1944,23 @@ Evita repetir títulos, enfoques y ejemplos del historial proporcionado.'''
         'Incluye únicamente el título educativo. Sin firmas ni marcas. '
         'Sin cifras, gráficos exactos, resultados ficticios ni promesas de ganancias. '
         'Texto neutro respecto al género.')
-    generated = edu_reference_image({
-        'model': os.getenv('EDU_IMAGE_MODEL', 'gpt-image-1'),
-        'prompt': style + '\nTítulo exacto: ' + title + '\nConcepto: ' + visual,
-        'size': '1024x1024', 'quality': 'medium', 'n': 1,
-        'input_fidelity': 'high',
-    })
-    image = edu_apply_signature(base64.b64decode(generated['data'][0]['b64_json'], validate=True))
-    if not image or len(image) > 10 * 1024 * 1024:
-        raise RuntimeError('Imagen vacía o demasiado grande para Telegram')
+    image = None
+    try:
+        generated = edu_reference_image({
+            'model': os.getenv('EDU_IMAGE_MODEL', 'gpt-image-1'),
+            'prompt': style + '\nTítulo exacto: ' + title + '\nConcepto: ' + visual,
+            'size': '1024x1024', 'quality': 'medium', 'n': 1,
+        })
+        image = edu_apply_signature(base64.b64decode(generated['data'][0]['b64_json'], validate=True))
+        if not image or len(image) > 10 * 1024 * 1024:
+            raise RuntimeError('Imagen vacía o demasiado grande para Telegram')
+    except Exception as exc:
+        edu_record_error(day, 'imagen', exc)
+        # Automatic continuity: publish the complete article as text at its usual slot.
+        image = None
     with edu_db() as db:
-        db.execute("UPDATE posts SET status='ready',publish_kind='article',title=?,caption=?,image=?,category=?,updated=? WHERE day=? AND status='generating'",
-                   (title, caption, image, category, datetime.now(timezone.utc).timestamp(), day))
+        db.execute("UPDATE posts SET status='ready',image=?,updated=? WHERE day=? AND status='generating'",
+                   (image, datetime.now(timezone.utc).timestamp(), day))
 
 
 async def edu_alert(bot, text):
@@ -1952,13 +2058,28 @@ def generate_summary(day, sources):
 def edu_generate(day):
     kind = education_kind(day)
     if kind == 'poll':
-        generate_poll(day)
+        try:
+            generate_poll(day)
+        except Exception as exc:
+            edu_record_error(day, 'encuesta', exc)
+            save_interaction(day, 'poll', '¿Qué hábito quieres fortalecer la próxima semana?',
+                             {'question': '¿Qué hábito quieres fortalecer la próxima semana?',
+                              'options': ['Respetar mis límites de riesgo', 'Registrar mis decisiones',
+                                          'Hacer pausas conscientes', 'Revisar mi plan antes de empezar']})
     elif kind == 'summary':
         sources = previous_month_articles(day)
         if sources:
-            generate_summary(day, sources)
+            try:
+                generate_summary(day, sources)
+            except Exception as exc:
+                edu_record_error(day, 'resumen', exc)
+                for source in sources:
+                    source['learning'] = 'Revisa este aprendizaje y elige una acción para tu rutina.'
+                save_interaction(day, 'summary', 'Aprendizajes del mes · ' + sources[0]['day'][:7],
+                                 {'intro': 'Retoma los aprendizajes compartidos durante el mes.',
+                                  'closing': 'Elige una idea y conviértela en una acción esta semana.',
+                                  'sources': sources})
         else:
-            # First month: keep an educational article rather than fabricate a recap.
             edu_generate_article(day)
     else:
         edu_generate_article(day)
@@ -1991,7 +2112,10 @@ async def send_education_content(bot, row, chat_id):
         if len(text.encode('utf-16-le')) // 2 > 4096:
             raise RuntimeError('Resumen excede el límite de Telegram')
         return await bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', disable_web_page_preview=True, read_timeout=120)
-    photo = io.BytesIO(row['image']); photo.name = 'educacion.png'
+    if not row['image']:
+        return await bot.send_message(chat_id=chat_id, text=row['caption'], parse_mode=None,
+                                      disable_web_page_preview=True, read_timeout=120)
+    photo = io.BytesIO(row['image']); photo.name = 'educacion.jpg'
     return await bot.send_photo(chat_id=chat_id, photo=photo, caption=row['caption'],
                                parse_mode=None, write_timeout=120, read_timeout=120)
 
@@ -2004,7 +2128,11 @@ async def education_tick(context):
     minute = now.hour * 60 + now.minute
     if not 650 <= minute < 690:  # catch up only until 11:30, never dump old posts
         return
-    day = now.date().isoformat()
+    await education_run(context)
+
+
+async def education_run(context, recover=False):
+    day = datetime.now(EDU_TZ).date().isoformat()
     if edu_claim(day):
         try:
             await asyncio.to_thread(edu_generate, day)
@@ -2012,12 +2140,12 @@ async def education_tick(context):
             with edu_db() as db:
                 db.execute("UPDATE posts SET status='failed',updated=? WHERE day=? AND status='generating'",
                            (datetime.now(timezone.utc).timestamp(), day))
-            logging.warning('Generación educativa fallida (%s)', type(exc).__name__)
-            await edu_alert(context.bot, '⚠️ No se pudo crear la publicación educativa. Se harán hasta 3 intentos. Revisa saldo, permisos de modelos, OPENAI_API_KEY y assets/education_reference.png.')
+            edu_record_error(day, 'preparación', exc)
+            await edu_alert(context.bot, '⚠️ No se pudo preparar la publicación: ' + edu_safe_error(exc) + '. Revisa /educacion_estado.')
             return
     row = edu_get(day)
     current = datetime.now(EDU_TZ)
-    if not row or row['status'] != 'ready' or not 660 <= current.hour * 60 + current.minute < 690:
+    if not row or row['status'] != 'ready' or (not recover and not 660 <= current.hour * 60 + current.minute < 690):
         return
     # Persist the claim BEFORE contacting Telegram; an ambiguous timeout is not retried.
     with edu_db() as db:
@@ -2035,19 +2163,44 @@ async def education_tick(context):
     with edu_db() as db:
         db.execute("UPDATE posts SET status='sent',message_id=?,image=NULL,updated=? WHERE day=?",
                    (message.message_id, datetime.now(timezone.utc).timestamp(), day))
-    await edu_alert(context.bot, '✅ Publicación educativa enviada: ' + row['title'])
+    notice = '✅ Publicación educativa enviada: ' + row['title']
+    if row.get('last_error'):
+        notice += '\nSe usó una alternativa: ' + row['last_error']
+        if row['publish_kind'] == 'article' and not row['image']:
+            notice += '\nEl artículo se publicó completo como texto porque la imagen no estuvo disponible.'
+    await edu_alert(context.bot, notice)
+
+
+async def education_retry(update, context):
+    # Explicit recovery only for TODAY. The persistent send claim still prevents duplicates.
+    if not is_admin_private(update):
+        return
+    if not edu_enabled():
+        await update.message.reply_text('La educación automática está desactivada.')
+        return
+    day = datetime.now(EDU_TZ).date().isoformat()
+    with edu_db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT status FROM posts WHERE day=?', (day,)).fetchone()
+        if not row or row[0] not in ('failed', 'ready'):
+            await update.message.reply_text('Solo se puede recuperar la publicación de hoy si está fallida o lista. No se repetirá un envío confirmado o incierto.')
+            return
+        if row[0] == 'failed':
+            db.execute("UPDATE posts SET attempts=0,updated=0,last_error=NULL WHERE day=? AND status='failed'", (day,))
+    await update.message.reply_text('Voy a recuperar la publicación de hoy y enviarla al canal una sola vez.')
+    await education_run(context, recover=True)
 
 
 async def education_status(update, context):
     if not is_admin_private(update):
         return
     with edu_db() as db:
-        rows = db.execute('SELECT day,status,title FROM posts ORDER BY updated DESC LIMIT 8').fetchall()
+        rows = db.execute('SELECT day,status,title,last_error FROM posts ORDER BY updated DESC LIMIT 8').fetchall()
     text = ('Educación automática: ' + ('ACTIVA' if edu_enabled() else 'INACTIVA') +
             '\nArtículos: martes y jueves · 11:00 a. m. Colombia\nEncuesta: sábado · 11:00 a. m.\nResumen: primer martes del mes · 11:00 a. m. (reemplaza artículo)\n' +
             'Saludos: ' + ('ACTIVOS' if greeting_enabled() and edu_enabled() else 'INACTIVOS') +
             '\nLunes a sábado 9:00 a. m. · Domingo 10:00 a. m. Colombia\n' +
-            '\n'.join(f'{d}: {s} — {t or "sin título"}' for d, s, t in rows))
+            '\n'.join(f'{d}: {s} — {t or "sin título"}' + (f'\nMotivo: {e}' if e else '') for d, s, t, e in rows))
     await update.message.reply_text(text)
 
 
@@ -2132,8 +2285,8 @@ async def greeting_tick(context):
             with edu_db() as db:
                 db.execute("UPDATE posts SET status='failed',updated=? WHERE day=? AND status='generating'",
                            (datetime.now(timezone.utc).timestamp(), key))
-            logging.warning('Generación de saludo fallida (%s)', type(exc).__name__)
-            await edu_alert(context.bot, '⚠️ No se pudo crear el saludo. Hasta 3 intentos; revisa saldo, API y referencia.')
+            edu_record_error(key, 'saludo', exc)
+            await edu_alert(context.bot, '⚠️ No se pudo crear el saludo: ' + edu_safe_error(exc) + '. Hasta 3 intentos; revisa /educacion_estado.')
             return
     now = datetime.now(EDU_TZ)
     row = edu_get(key)
@@ -2210,6 +2363,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("educacion_estado", education_status))
     application.add_handler(CommandHandler("educacion_vista", education_preview))
+    application.add_handler(CommandHandler("educacion_reintentar", education_retry))
     application.add_handler(CallbackQueryHandler(on_button))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     application.add_error_handler(error_handler)
