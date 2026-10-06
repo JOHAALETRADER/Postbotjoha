@@ -1945,6 +1945,10 @@ operar, depositar o recuperar pérdidas. El llamado cuenta dentro del límite de
 Devuelve JSON con title, body, image_prompt. Título máximo 60 caracteres;
 body entre 450 y 650 caracteres en TOTAL, incluyendo espacios y saltos de línea, con párrafos cortos, una idea útil explicada y
 un ejemplo cuando corresponda. Sin markdown, enlaces, hashtags ni firma.
+Usa 2 o 3 emojis discretos y pertinentes en TOTAL dentro de body, al inicio de
+párrafos para destacar el aprendizaje y el llamado a la acción (por ejemplo
+🧠, 💡, 🎯). No los pongas en title ni image_prompt, ni junto a cada frase.
+Los emojis y espacios cuentan dentro del límite de longitud de body.
 No inventes resultados, estadísticas, citas, noticias o experiencias personales.
 No recomiendes activos ni prometas ganancias. No presentes martingala como
 protección: aumenta exposición; las pérdidas acumuladas cuentan para el riesgo.
