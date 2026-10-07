@@ -1782,6 +1782,22 @@ def edu_reference_image(payload):
         raise RuntimeError('Falta assets/brand_signature.png')
     payload = dict(payload)
     payload.pop('input_fidelity', None)
+    greeting = payload.pop('_greeting', False)
+    if greeting:
+        payload['prompt'] += (
+            '\nDIRECCIÓN FINAL PARA SALUDOS: fotografía profesional hiperrealista de una sola escena, '
+            'luz natural creíble, materiales reales, perspectiva y arquitectura plausibles. '
+            'Respeta el escenario solicitado; no lo sustituyas siempre por un amanecer. '
+            'Colores naturales del lugar, SIN imponer negro, morado ni dorado de la marca. '
+            'Sin personas, ilustraciones, caricaturas, aspecto de render, collage ni fantasía. '
+            'Título discreto y elegante en una o dos líneas, tipografía sencilla y legible, '
+            'altura total del texto como máximo 10% de la imagen, con buen contraste. '
+            'Único texto: el título solicitado; sin firmas, marcas, logos ni letras adicionales. '
+            'Reserva entre el 72% y el 88% de la altura una zona visualmente limpia y de '
+            'contraste suficiente para superponer después una firma dorada pequeña desde un PNG. '
+            'No añadas una franja negra; el escenario continúa hasta los bordes. '
+            'Estas instrucciones prevalecen sobre las descripciones anteriores.')
+        return edu_api('images/generations', payload)
     payload['prompt'] = payload.get('prompt', '') + (
         '\nDIRECCIÓN VISUAL FINAL OBLIGATORIA: fotografía editorial realista, nivel profesional. '
         'Usa una única escena principal coherente, luz natural o de estudio creíble, '
@@ -2054,11 +2070,21 @@ async def edu_alert(bot, text):
 # --------- Interacción semanal y resumen mensual ---------
 def education_kind(day):
     date = datetime.strptime(day, '%Y-%m-%d')
-    if date.weekday() == 5:
+    if date.weekday() in (2, 5):
         return 'poll'
     if date.weekday() == 1 and date.day <= 7:
         return 'summary'
     return 'article'
+
+
+def education_schedule(day):
+    # Minutes in Colombia time: preparation, publication, end of catch-up window.
+    weekday = datetime.strptime(day, '%Y-%m-%d').weekday()
+    if weekday == 2:
+        return (920, 930, 960)  # Wednesday 15:20 / 15:30 / 16:00.
+    if weekday in (1, 3, 5):
+        return (650, 660, 690)  # Tuesday/Thursday/Saturday 10:50 / 11:00 / 11:30.
+    return None
 
 
 def previous_month_articles(day):
@@ -2081,6 +2107,9 @@ def save_interaction(day, kind, title, payload):
 
 
 def generate_poll(day):
+    focus = ('Mitad de semana: cómo va tu disciplina, qué hábito ajustar hoy o qué tema quieres aprender.'
+             if datetime.strptime(day, '%Y-%m-%d').weekday() == 2 else
+             'Cierre de semana: reflexionar sobre hábitos y aprendizajes y preparar la próxima semana.')
     with edu_db() as db:
         previous = db.execute("SELECT title FROM posts WHERE publish_kind='poll' AND status='sent' ORDER BY day DESC LIMIT 20").fetchall()
     for _ in range(2):
@@ -2094,7 +2123,7 @@ def generate_poll(day):
                 'Devuelve JSON: question de máximo 220 caracteres y options con 3 o 4 opciones '
                 'distintas de máximo 80 caracteres, claras y mutuamente diferenciadas. Sin markdown. '
                 'No repitas preguntas del historial.'},
-                {'role': 'user', 'content': json.dumps({'fecha': day, 'historial': previous}, ensure_ascii=False)}],
+                {'role': 'user', 'content': json.dumps({'fecha': day, 'enfoque': focus, 'historial': previous}, ensure_ascii=False)}],
             'response_format': {'type': 'json_object'}, 'max_tokens': 500})
         obj = json.loads(result['choices'][0]['message']['content'])
         q = obj.get('question'); options = obj.get('options')
@@ -2143,8 +2172,11 @@ def edu_generate(day):
             generate_poll(day)
         except Exception as exc:
             edu_record_error(day, 'encuesta', exc)
-            save_interaction(day, 'poll', '¿Qué hábito quieres fortalecer la próxima semana?',
-                             {'question': '¿Qué hábito quieres fortalecer la próxima semana?',
+            question = ('¿Qué hábito quieres reforzar en lo que queda de semana?'
+                        if datetime.strptime(day, '%Y-%m-%d').weekday() == 2 else
+                        '¿Qué hábito quieres fortalecer la próxima semana?')
+            save_interaction(day, 'poll', question,
+                             {'question': question,
                               'options': ['Respetar mis límites de riesgo', 'Registrar mis decisiones',
                                           'Hacer pausas conscientes', 'Revisar mi plan antes de empezar']})
     elif kind == 'summary':
@@ -2203,11 +2235,11 @@ async def send_education_content(bot, row, chat_id):
 
 async def education_tick(context):
     now = datetime.now(EDU_TZ)
-    # Tuesday / Thursday / Saturday; prepare at 10:50 and send at 11:00.
-    if not edu_enabled() or now.weekday() not in (1, 3, 5):
+    schedule = education_schedule(now.date().isoformat())
+    if not edu_enabled() or schedule is None:
         return
     minute = now.hour * 60 + now.minute
-    if not 650 <= minute < 690:  # catch up only until 11:30, never dump old posts
+    if not schedule[0] <= minute < schedule[2]:  # Never dump old posts outside today's window.
         return
     await education_run(context)
 
@@ -2226,7 +2258,9 @@ async def education_run(context, recover=False):
             return
     row = edu_get(day)
     current = datetime.now(EDU_TZ)
-    if not row or row['status'] != 'ready' or (not recover and not 660 <= current.hour * 60 + current.minute < 690):
+    schedule = education_schedule(day)
+    if not row or row['status'] != 'ready' or (not recover and
+            (schedule is None or not schedule[1] <= current.hour * 60 + current.minute < schedule[2])):
         return
     # Persist the claim BEFORE contacting Telegram; an ambiguous timeout is not retried.
     with edu_db() as db:
@@ -2304,7 +2338,7 @@ async def education_status(update, context):
     with edu_db() as db:
         rows = db.execute('SELECT day,status,title,last_error FROM posts ORDER BY updated DESC LIMIT 8').fetchall()
     text = ('Educación automática: ' + ('ACTIVA' if edu_enabled() else 'INACTIVA') +
-            '\nArtículos: martes y jueves · 11:00 a. m. Colombia\nEncuesta: sábado · 11:00 a. m.\nResumen: primer martes del mes · 11:00 a. m. (reemplaza artículo)\n' +
+            '\nArtículos: martes y jueves · 11:00 a. m. Colombia\nEncuestas: miércoles · 3:30 p. m. y sábado · 11:00 a. m.\nResumen: primer martes del mes · 11:00 a. m. (reemplaza artículo)\n' +
             'Saludos: ' + ('ACTIVOS' if greeting_enabled() and edu_enabled() else 'INACTIVOS') +
             '\nLunes a sábado 9:00 a. m. · Domingo 10:00 a. m. Colombia\n' +
             '\n'.join(f'{d}: {s} — {t or "sin título"}' + (f'\nMotivo: {e}' if e else '') for d, s, t, e in rows))
@@ -2318,7 +2352,7 @@ async def education_preview(update, context):
     if row and row['status'] == 'ready':
         await send_education_content(context.bot, row, ADMIN_ID)
     else:
-        await update.message.reply_text('No hay una publicación preparada pendiente. La preparación automática comienza a las 10:50 en los días establecidos.')
+        await update.message.reply_text('No hay una publicación preparada pendiente. La preparación comienza a las 3:20 p. m. los miércoles y a las 10:50 a. m. los martes, jueves y sábados.')
 
 
 # --------- Saludos diarios automáticos ---------
@@ -2329,23 +2363,51 @@ def greeting_enabled():
 def greeting_generate(key, sunday):
     with edu_db() as db:
         history = db.execute("SELECT caption FROM posts WHERE day LIKE 'greeting:%' AND status='sent' ORDER BY updated DESC LIMIT 60").fetchall()
-    theme = ('Saludo dominical: agradecer la semana, bendiciones, aprendizajes y esperanza; '
-             'prepararse con buena actitud para la semana que comienza mañana. '
-             'No presupongas que todo salió bien ni inventes resultados de la comunidad.' if sunday else
-             'Buenos días: energía positiva, calma, gratitud y motivación para disfrutar el día.')
+    # Rotate scenarios and occasional trading focus using confirmed greetings only.
+    with edu_db() as db:
+        index = db.execute("SELECT COUNT(*) FROM posts WHERE day LIKE 'greeting:%' AND status='sent'").fetchone()[0]
+    scenes = (
+        'terraza de una casa contemporánea espectacular con piscina y jardín',
+        'playa tropical con agua cristalina y luz de mañana',
+        'vista de una ciudad desde el balcón de un apartamento elegante',
+        'casa hermosa entre montañas, con ventanales y vistas abiertas',
+        'río transparente entre vegetación natural',
+        'interior luminoso de una casa hermosa, con materiales naturales',
+        'cascada real rodeada de bosque',
+        'centro comercial moderno con arquitectura real y luz natural',
+        'panorama de montañas con cielo despejado',
+        'patio de una residencia de lujo con piscina y vista al mar',
+        'espacio de trabajo realista junto a una ventana con vista urbana',
+    )
+    scene = scenes[index % len(scenes)]
+    trading = not sunday and index % 3 == 2
+    theme = ('Domingo con alegría y energía: reconocer aprendizajes de la semana y animar '
+             'a preparar un primer paso concreto para el lunes. Sin inventar resultados.' if sunday else
+             'Buenos días con alegría, impulso y energía para ponerse en marcha y avanzar hoy.')
+    theme += (' Incluye una referencia breve al trading: preparación, disciplina, gestión '
+              'del riesgo o seguir el plan; nunca urgencia por operar ni ganancias prometidas.' if trading else
+              ' Motivación para la vida diaria; no es necesario mencionar trading.')
     instruction = ('Escribe para JT TRADERS TEAMS en español, tuteando y SIN asignar género a quien lee. '
-        'Tono muy positivo, motivador, cálido y natural. Nada de miedo, culpa ni promesas financieras. '
+        'Tono alegre, vital, enérgico, cercano y muy positivo: que despierte ganas de actuar. '
+        'Frases concretas, ritmo ágil y una acción pequeña que se pueda empezar hoy. '
+        'Evita mensajes contemplativos o religiosos, bendiciones, sermones, calma, serenidad, '
+        'respira profundo y clichés repetidos de luz y gratitud. Sin gritos ni presión. '
+        'No culpabilices a quien tiene poca energía ni sugieras que la motivación cura depresión. '
+        'Nada de miedo, culpa, ventas ni promesas financieras o de riqueza. '
         'Mensaje breve de 180 a 380 caracteres, 2 párrafos cortos y máximo 2 emojis. '
-        'Termina con una invitación sencilla y positiva para el día. Sin ventas ni llamados a depositar u operar. '
-        'No inventes citas ni experiencias personales. Sin markdown, enlaces, hashtags ni firma. '
+        'Termina con una invitación concreta, alegre y positiva a dar un primer paso. '
+        'Sin llamados a depositar ni a operar. No inventes citas ni experiencias personales. '
+        'Sin markdown, enlaces, hashtags ni firma. '
         'Devuelve JSON con title (máximo 45 caracteres), body e image_prompt. '
-        'image_prompt describe un paisaje luminoso, amanecer, naturaleza o escena de buenos días '
-        'acorde al mensaje, sin personas. Varía paisajes y enfoques frente al historial.')
+        'image_prompt describe una fotografía profesional del escenario asignado, sin personas, '
+        'con colores naturales y luz de mañana. No impongas los colores de la marca. '
+        'Las casas de lujo son escenarios, nunca una promesa de resultados del trading. '
+        'Varía composición, detalles y enfoque respecto al historial. Título sin emojis.')
     for _ in range(2):
         response = edu_api('chat/completions', {
             'model': os.getenv('EDU_TEXT_MODEL', 'gpt-4.1-mini'),
             'messages': [{'role': 'system', 'content': instruction},
-                         {'role': 'user', 'content': json.dumps({'tema': theme, 'historial': history}, ensure_ascii=False)}],
+                         {'role': 'user', 'content': json.dumps({'tema': theme, 'escenario': scene, 'historial': history}, ensure_ascii=False)}],
             'response_format': {'type': 'json_object'}, 'max_tokens': 600})
         obj = json.loads(response['choices'][0]['message']['content'])
         title = str(obj.get('title', '')).strip()
@@ -2361,18 +2423,45 @@ def greeting_generate(key, sunday):
     generated = edu_reference_image({
         'model': os.getenv('EDU_IMAGE_MODEL', 'gpt-image-1'),
         'prompt': ('Crea una imagen NUEVA luminosa y motivadora para un saludo de buenos días. '
-            'Paisaje natural alusivo al mensaje. Morado y luz dorada con detalles negros discretos; '
-            'no oscurezcas el paisaje, sin sobrecarga ni lujo excesivo. '
+            'Fotografía hiperrealista del escenario asignado, atractiva, alegre y luminosa. '
+            'Paleta natural del lugar; arquitectura y texturas creíbles. '
             'Sin personas ni gráficos financieros, firmas ni marcas. '
-            'Incluye solamente el título nuevo. Texto neutro en género. '
-            '\nTítulo: ' + title + '\nEscena: ' + visual),
-        'size': '1024x1024', 'quality': 'medium', 'n': 1, 'input_fidelity': 'high'})
+            'Incluye solamente el título nuevo, pequeño y discreto. Texto neutro en género. '
+            '\nTítulo: ' + title + '\nEscenario asignado: ' + scene + '\nEscena: ' + visual),
+        'size': '1024x1024', 'quality': 'medium', 'n': 1, '_greeting': True})
     image = edu_apply_signature(base64.b64decode(generated['data'][0]['b64_json'], validate=True))
     if not image or len(image) > 10 * 1024 * 1024:
         raise RuntimeError('Imagen de saludo inválida')
     with edu_db() as db:
         db.execute("UPDATE posts SET status='ready',title=?,caption=?,image=?,category=?,updated=? WHERE day=? AND status='generating'",
                    (title, caption, image, 'domingo' if sunday else 'buenos días', datetime.now(timezone.utc).timestamp(), key))
+
+
+async def greeting_test(update, context):
+    # Private preview with isolated storage; no scheduled send or history mutation.
+    if not is_admin_private(update):
+        return
+    import uuid
+    key = 'preview:greeting:' + uuid.uuid4().hex
+    await update.message.reply_text('Estoy preparando un saludo con imagen. Lo recibirás aquí por privado.')
+    try:
+        if not edu_claim(key):
+            return
+        sunday = 'domingo' in (context.args or [])
+        await asyncio.to_thread(greeting_generate, key, sunday)
+        row = edu_get(key)
+        if not row or row['status'] != 'ready':
+            raise RuntimeError('No se pudo preparar la muestra')
+        photo = io.BytesIO(row['image'])
+        photo.name = 'saludo.jpg'
+        await context.bot.send_photo(chat_id=ADMIN_ID, photo=photo, caption=row['caption'],
+                                     parse_mode=None, read_timeout=120, write_timeout=120)
+        await update.message.reply_text('Muestra enviada. Los horarios del canal siguen igual.')
+    except Exception as exc:
+        await update.message.reply_text('No se pudo completar la prueba: ' + edu_safe_error(exc))
+    finally:
+        with edu_db() as db:
+            db.execute("DELETE FROM posts WHERE day=? AND day LIKE 'preview:greeting:%'", (key,))
 
 
 async def greeting_tick(context):
@@ -2435,7 +2524,7 @@ async def education_startup(application):
     if greeting_enabled():
         application.job_queue.run_repeating(greeting_tick, interval=30, first=3,
             name='greetings_automatic', job_kwargs={'max_instances': 1, 'coalesce': True})
-    logging.info('Artículos mar/jue, encuesta sáb, resumen primer martes 11:00; saludos lun-sáb 09:00 y domingo 10:00 Colombia')
+    logging.info('Artículos mar/jue, encuesta sáb, resumen primer martes 11:00; encuesta miércoles 15:30; saludos lun-sáb 09:00 y domingo 10:00 Colombia')
 
 
 # --------- Main ---------
@@ -2472,6 +2561,7 @@ def main() -> None:
     application.add_handler(CommandHandler("educacion_vista", education_preview))
     application.add_handler(CommandHandler("educacion_reintentar", education_retry))
     application.add_handler(CommandHandler("educacion_prueba", education_test))
+    application.add_handler(CommandHandler("saludo_prueba", greeting_test))
     application.add_handler(CallbackQueryHandler(on_button))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     application.add_error_handler(error_handler)
