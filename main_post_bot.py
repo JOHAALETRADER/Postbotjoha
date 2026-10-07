@@ -1775,6 +1775,47 @@ def edu_apply_signature(image_bytes):
     return output.getvalue()
 
 
+def greeting_add_title(image_bytes, title):
+    # Deterministic top placement: never overlap the fixed signature near the bottom.
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        canvas = source.convert('RGB')
+    width, height = canvas.size
+    draw = ImageDraw.Draw(canvas)
+    max_width = round(width * 0.84)
+    words = title.split()
+    for size in range(max(12, round(width * 0.040)), 11, -1):
+        try:
+            font = ImageFont.truetype('DejaVuSans.ttf', size)
+        except OSError:
+            font = ImageFont.load_default(size=size)
+        lines = []
+        line = ''
+        for word in words:
+            candidate = (line + ' ' + word).strip()
+            if line and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+        if line:
+            lines.append(line)
+        if len(lines) <= 2 and all(draw.textbbox((0, 0), line, font=font)[2] <= max_width for line in lines):
+            break
+    stroke = max(1, round(width * 0.002))
+    y = round(height * 0.07)
+    for line in lines:
+        box = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
+        x = (width - (box[2] - box[0])) // 2 - box[0]
+        draw.text((x, y - box[1]), line, font=font, fill='white',
+                  stroke_width=stroke, stroke_fill=(35, 35, 35))
+        y += box[3] - box[1] + round(height * 0.012)
+    output = io.BytesIO()
+    canvas.save(output, format='JPEG', quality=95)
+    return output.getvalue()
+
+
 def edu_reference_image(payload):
     # Keep the shared call interface; generate backgrounds without branding.
     # Validate the asset before paying for image generation.
@@ -1786,17 +1827,20 @@ def edu_reference_image(payload):
     if greeting:
         payload['prompt'] += (
             '\nDIRECCIÓN FINAL PARA SALUDOS: fotografía profesional hiperrealista de una sola escena, '
-            'luz natural creíble, materiales reales, perspectiva y arquitectura plausibles. '
+            'luminosa y alegre, con colores naturales variados y vivos sin sobresaturación. '
+            'Evita interiores totalmente beige, marrones, grises o de un solo color; combina '
+            'materiales reales con vegetación verde, cielo azul, agua turquesa, flores o alimentos '
+            'de colores cuando correspondan al lugar. Luz blanca natural, sin filtro sepia ni tinte uniforme. '
             'Respeta el escenario solicitado; no lo sustituyas siempre por un amanecer. '
-            'Colores naturales del lugar, SIN imponer negro, morado ni dorado de la marca. '
-            'Sin personas, ilustraciones, caricaturas, aspecto de render, collage ni fantasía. '
-            'Título discreto y elegante en una o dos líneas, tipografía sencilla y legible, '
-            'altura total del texto como máximo 10% de la imagen, con buen contraste. '
-            'Único texto: el título solicitado; sin firmas, marcas, logos ni letras adicionales. '
-            'Reserva entre el 72% y el 88% de la altura una zona visualmente limpia y de '
-            'contraste suficiente para superponer después una firma dorada pequeña desde un PNG. '
-            'No añadas una franja negra; el escenario continúa hasta los bordes. '
-            'Estas instrucciones prevalecen sobre las descripciones anteriores.')
+            'SIN imponer negro, morado ni dorado de la marca. Arquitectura y objetos plausibles, '
+            'sin personas, caricaturas, collage, aspecto de render ni fantasía. '
+            'Puede haber un gráfico de trading realista ÚNICAMENTE dentro de la pantalla de un computador '
+            'si el escenario es un escritorio; nunca gráficos flotantes. '
+            'NO generes título, letras, firmas, marcas, logotipos ni marcas de agua. '
+            'El título y la firma se añadirán después desde el código. Ignora cualquier petición '
+            'anterior de escribir texto. Deja el 5% al 20% superior visualmente sencillo para el título '
+            'y el 72% al 88% inferior limpio para la firma, sin franjas negras ni paneles artificiales. '
+            'El escenario continúa hasta los bordes. Estas instrucciones prevalecen sobre las anteriores.')
         return edu_api('images/generations', payload)
     payload['prompt'] = payload.get('prompt', '') + (
         '\nDIRECCIÓN VISUAL FINAL OBLIGATORIA: fotografía editorial realista, nivel profesional. '
@@ -2377,7 +2421,8 @@ def greeting_generate(key, sunday):
         'centro comercial moderno con arquitectura real y luz natural',
         'panorama de montañas con cielo despejado',
         'patio de una residencia de lujo con piscina y vista al mar',
-        'espacio de trabajo realista junto a una ventana con vista urbana',
+        'escritorio junto a una ventana: computador con gráfico de trading en pantalla, taza de café, plato de desayuno con frutas frescas y vista urbana',
+        'mesa de desayuno en una terraza con flores, jardín verde y piscina azul',
     )
     scene = scenes[index % len(scenes)]
     trading = not sunday and index % 3 == 2
@@ -2388,19 +2433,22 @@ def greeting_generate(key, sunday):
               'del riesgo o seguir el plan; nunca urgencia por operar ni ganancias prometidas.' if trading else
               ' Motivación para la vida diaria; no es necesario mencionar trading.')
     instruction = ('Escribe para JT TRADERS TEAMS en español, tuteando y SIN asignar género a quien lee. '
-        'Tono alegre, vital, enérgico, cercano y muy positivo: que despierte ganas de actuar. '
+        'Tono alegre, electrizante, vital, cercano y muy positivo: que despierte ganas de actuar. '
+        'Usa entusiasmo natural, exclamaciones breves y frases como ¡Vamos con toda! sin repetir siempre la misma. '
         'Frases concretas, ritmo ágil y una acción pequeña que se pueda empezar hoy. '
         'Evita mensajes contemplativos o religiosos, bendiciones, sermones, calma, serenidad, '
         'respira profundo y clichés repetidos de luz y gratitud. Sin gritos ni presión. '
         'No culpabilices a quien tiene poca energía ni sugieras que la motivación cura depresión. '
         'Nada de miedo, culpa, ventas ni promesas financieras o de riqueza. '
-        'Mensaje breve de 180 a 380 caracteres, 2 párrafos cortos y máximo 2 emojis. '
+        'Mensaje breve de 180 a 380 caracteres, 2 párrafos cortos y 2 o 3 emojis '
+        'de energía como ☀️, ⚡, 🚀 o 💪 distribuidos al comienzo de párrafos o en el cierre. '
         'Termina con una invitación concreta, alegre y positiva a dar un primer paso. '
         'Sin llamados a depositar ni a operar. No inventes citas ni experiencias personales. '
         'Sin markdown, enlaces, hashtags ni firma. '
         'Devuelve JSON con title (máximo 45 caracteres), body e image_prompt. '
         'image_prompt describe una fotografía profesional del escenario asignado, sin personas, '
-        'con colores naturales y luz de mañana. No impongas los colores de la marca. '
+        'con colores naturales variados, vegetación, detalles vivos y luz blanca de mañana; '
+        'evita ambientes monocromáticos beige, marrones o sepia. No impongas los colores de la marca. '
         'Las casas de lujo son escenarios, nunca una promesa de resultados del trading. '
         'Varía composición, detalles y enfoque respecto al historial. Título sin emojis.')
     for _ in range(2):
@@ -2425,11 +2473,12 @@ def greeting_generate(key, sunday):
         'prompt': ('Crea una imagen NUEVA luminosa y motivadora para un saludo de buenos días. '
             'Fotografía hiperrealista del escenario asignado, atractiva, alegre y luminosa. '
             'Paleta natural del lugar; arquitectura y texturas creíbles. '
-            'Sin personas ni gráficos financieros, firmas ni marcas. '
-            'Incluye solamente el título nuevo, pequeño y discreto. Texto neutro en género. '
+            'Sin personas, firmas, marcas ni textos. Si hay un computador, permite un gráfico '
+            'de trading realista dentro de su pantalla. No escribas el título: se añade después. '
             '\nTítulo: ' + title + '\nEscenario asignado: ' + scene + '\nEscena: ' + visual),
         'size': '1024x1024', 'quality': 'medium', 'n': 1, '_greeting': True})
-    image = edu_apply_signature(base64.b64decode(generated['data'][0]['b64_json'], validate=True))
+    background = base64.b64decode(generated['data'][0]['b64_json'], validate=True)
+    image = edu_apply_signature(greeting_add_title(background, title))
     if not image or len(image) > 10 * 1024 * 1024:
         raise RuntimeError('Imagen de saludo inválida')
     with edu_db() as db:
