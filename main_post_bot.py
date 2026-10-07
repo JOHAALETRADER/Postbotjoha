@@ -1746,7 +1746,7 @@ def edu_signature_path():
     return Path(os.getenv('EDU_SIGNATURE_IMAGE', str(Path(__file__).resolve().parent / 'assets' / 'brand_signature.png')))
 
 
-def edu_apply_signature(image_bytes):
+def edu_apply_signature(image_bytes, greeting=False):
     # Fixed PNG: spelling and handwriting never depend on image generation.
     from PIL import Image
     import io
@@ -1768,51 +1768,18 @@ def edu_apply_signature(image_bytes):
     signature = signature.resize((max(1, round(signature.width * scale)),
                                   max(1, round(signature.height * scale))), Image.Resampling.LANCZOS)
     x = (width - signature.width) // 2
-    y = height - round(height * 0.12) - signature.height
+    y = height - round(height * (0.045 if greeting else 0.12)) - signature.height
+    if greeting:
+        # Subtle shadow improves gold visibility without a banner or a larger signature.
+        from PIL import ImageFilter
+        shadow = Image.new('RGBA', signature.size, (0, 0, 0, 0))
+        shadow.putalpha(signature.getchannel('A'))
+        layer = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
+        layer.alpha_composite(shadow, (x + 1, y + 2))
+        canvas = Image.alpha_composite(canvas, layer.filter(ImageFilter.GaussianBlur(2)))
     canvas.alpha_composite(signature, (x, y))
     output = io.BytesIO()
     canvas.convert('RGB').save(output, format='JPEG', quality=95)
-    return output.getvalue()
-
-
-def greeting_add_title(image_bytes, title):
-    # Deterministic top placement: never overlap the fixed signature near the bottom.
-    from PIL import Image, ImageDraw, ImageFont
-    import io
-    with Image.open(io.BytesIO(image_bytes)) as source:
-        canvas = source.convert('RGB')
-    width, height = canvas.size
-    draw = ImageDraw.Draw(canvas)
-    max_width = round(width * 0.84)
-    words = title.split()
-    for size in range(max(12, round(width * 0.040)), 11, -1):
-        try:
-            font = ImageFont.truetype('DejaVuSans.ttf', size)
-        except OSError:
-            font = ImageFont.load_default(size=size)
-        lines = []
-        line = ''
-        for word in words:
-            candidate = (line + ' ' + word).strip()
-            if line and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
-                lines.append(line)
-                line = word
-            else:
-                line = candidate
-        if line:
-            lines.append(line)
-        if len(lines) <= 2 and all(draw.textbbox((0, 0), line, font=font)[2] <= max_width for line in lines):
-            break
-    stroke = max(1, round(width * 0.002))
-    y = round(height * 0.07)
-    for line in lines:
-        box = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
-        x = (width - (box[2] - box[0])) // 2 - box[0]
-        draw.text((x, y - box[1]), line, font=font, fill='white',
-                  stroke_width=stroke, stroke_fill=(35, 35, 35))
-        y += box[3] - box[1] + round(height * 0.012)
-    output = io.BytesIO()
-    canvas.save(output, format='JPEG', quality=95)
     return output.getvalue()
 
 
@@ -1837,9 +1804,10 @@ def edu_reference_image(payload):
             'Puede haber un gráfico de trading realista ÚNICAMENTE dentro de la pantalla de un computador '
             'si el escenario es un escritorio; nunca gráficos flotantes. '
             'NO generes título, letras, firmas, marcas, logotipos ni marcas de agua. '
-            'El título y la firma se añadirán después desde el código. Ignora cualquier petición '
-            'anterior de escribir texto. Deja el 5% al 20% superior visualmente sencillo para el título '
-            'y el 72% al 88% inferior limpio para la firma, sin franjas negras ni paneles artificiales. '
+            'La imagen NO llevará título: solo se añadirá después una firma fija desde un archivo. '
+            'Ignora cualquier petición anterior de escribir texto. Reserva del 85% al 96% de '
+            'la altura una zona sencilla con contraste para una firma dorada pequeña, sin '
+            'objetos importantes detrás, franjas negras ni paneles artificiales. '
             'El escenario continúa hasta los bordes. Estas instrucciones prevalecen sobre las anteriores.')
         return edu_api('images/generations', payload)
     payload['prompt'] = payload.get('prompt', '') + (
@@ -2384,7 +2352,7 @@ async def education_status(update, context):
     text = ('Educación automática: ' + ('ACTIVA' if edu_enabled() else 'INACTIVA') +
             '\nArtículos: martes y jueves · 11:00 a. m. Colombia\nEncuestas: miércoles · 3:30 p. m. y sábado · 11:00 a. m.\nResumen: primer martes del mes · 11:00 a. m. (reemplaza artículo)\n' +
             'Saludos: ' + ('ACTIVOS' if greeting_enabled() and edu_enabled() else 'INACTIVOS') +
-            '\nLunes a sábado 9:00 a. m. · Domingo 10:00 a. m. Colombia\n' +
+            '\nLunes a sábado 8:00 a. m. · Domingo 10:00 a. m. Colombia\n' +
             '\n'.join(f'{d}: {s} — {t or "sin título"}' + (f'\nMotivo: {e}' if e else '') for d, s, t, e in rows))
     await update.message.reply_text(text)
 
@@ -2474,11 +2442,11 @@ def greeting_generate(key, sunday):
             'Fotografía hiperrealista del escenario asignado, atractiva, alegre y luminosa. '
             'Paleta natural del lugar; arquitectura y texturas creíbles. '
             'Sin personas, firmas, marcas ni textos. Si hay un computador, permite un gráfico '
-            'de trading realista dentro de su pantalla. No escribas el título: se añade después. '
-            '\nTítulo: ' + title + '\nEscenario asignado: ' + scene + '\nEscena: ' + visual),
+            'de trading realista dentro de su pantalla. No escribas ningún título ni texto. '
+            '\nEscenario asignado: ' + scene + '\nEscena: ' + visual),
         'size': '1024x1024', 'quality': 'medium', 'n': 1, '_greeting': True})
     background = base64.b64decode(generated['data'][0]['b64_json'], validate=True)
-    image = edu_apply_signature(greeting_add_title(background, title))
+    image = edu_apply_signature(background, greeting=True)
     if not image or len(image) > 10 * 1024 * 1024:
         raise RuntimeError('Imagen de saludo inválida')
     with edu_db() as db:
@@ -2518,7 +2486,7 @@ async def greeting_tick(context):
         return
     now = datetime.now(EDU_TZ)
     sunday = now.weekday() == 6
-    target = 600 if sunday else 540
+    target = 600 if sunday else 480
     minute = now.hour * 60 + now.minute
     if not target - 10 <= minute < target + 30:
         return
@@ -2573,7 +2541,7 @@ async def education_startup(application):
     if greeting_enabled():
         application.job_queue.run_repeating(greeting_tick, interval=30, first=3,
             name='greetings_automatic', job_kwargs={'max_instances': 1, 'coalesce': True})
-    logging.info('Artículos mar/jue, encuesta sáb, resumen primer martes 11:00; encuesta miércoles 15:30; saludos lun-sáb 09:00 y domingo 10:00 Colombia')
+    logging.info('Artículos mar/jue, encuesta sáb, resumen primer martes 11:00; encuesta miércoles 15:30; saludos lun-sáb 08:00 y domingo 10:00 Colombia')
 
 
 # --------- Main ---------
