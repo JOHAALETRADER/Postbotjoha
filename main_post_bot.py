@@ -1769,14 +1769,13 @@ def edu_apply_signature(image_bytes, greeting=False):
                                   max(1, round(signature.height * scale))), Image.Resampling.LANCZOS)
     x = (width - signature.width) // 2
     y = height - round(height * (0.045 if greeting else 0.12)) - signature.height
-    if greeting:
-        # Subtle shadow improves gold visibility without a banner or a larger signature.
-        from PIL import ImageFilter
-        shadow = Image.new('RGBA', signature.size, (0, 0, 0, 0))
-        shadow.putalpha(signature.getchannel('A'))
-        layer = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
-        layer.alpha_composite(shadow, (x + 1, y + 2))
-        canvas = Image.alpha_composite(canvas, layer.filter(ImageFilter.GaussianBlur(2)))
+    # Subtle shadow improves gold visibility without a banner or a larger signature.
+    from PIL import ImageFilter
+    shadow = Image.new('RGBA', signature.size, (0, 0, 0, 0))
+    shadow.putalpha(signature.getchannel('A'))
+    layer = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
+    layer.alpha_composite(shadow, (x + 1, y + 2))
+    canvas = Image.alpha_composite(canvas, layer.filter(ImageFilter.GaussianBlur(2)))
     canvas.alpha_composite(signature, (x, y))
     output = io.BytesIO()
     canvas.convert('RGB').save(output, format='JPEG', quality=95)
