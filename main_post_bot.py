@@ -1,6 +1,7 @@
 import logging
 import os
 import copy
+import functools
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 
@@ -27,6 +28,92 @@ PENDING_ALBUMS: Dict[int, Dict[str, Any]] = {}
 
 ADMIN_ID: int = 0
 TARGET_CHAT_ID: Any = None
+
+
+# Manual state uses the existing persistent volume, separate from educational posts.
+def manual_state_db():
+    root = Path(os.getenv('POST_DATA_DIR', os.getenv('EDU_DATA_DIR', '/data/education')))
+    root.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(root / 'manual_state.sqlite3'), timeout=30)
+    db.execute("CREATE TABLE IF NOT EXISTS manual_users (user_id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+    return db
+
+
+def manual_pack(value):
+    if isinstance(value, InlineKeyboardButton):
+        return {'__post_button__': value.to_dict()}
+    if isinstance(value, datetime):
+        return {'__post_datetime__': value.isoformat()}
+    if isinstance(value, dict):
+        return {k: manual_pack(v) for k, v in value.items()
+                if k not in ('job', 'received_album_media', 'received_album_caption')}
+    if isinstance(value, (list, tuple)):
+        return [manual_pack(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError('Estado manual no serializable')
+
+
+def manual_unpack(value):
+    if isinstance(value, dict):
+        if '__post_button__' in value:
+            return InlineKeyboardButton.de_json(value['__post_button__'], None)
+        if '__post_datetime__' in value:
+            return datetime.fromisoformat(value['__post_datetime__'])
+        return {k: manual_unpack(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [manual_unpack(v) for v in value]
+    return value
+
+
+def manual_save(user_id, user_data=None):
+    with manual_state_db() as db:
+        previous = db.execute('SELECT payload FROM manual_users WHERE user_id=?', (user_id,)).fetchone()
+        flow = json.loads(previous[0]).get('flow', {}) if previous else {}
+        if user_data is not None:
+            flow = manual_pack(dict(user_data))
+        payload = {'draft': manual_pack(DRAFTS.get(user_id, {})),
+                   'defaults': manual_pack(DEFAULTS.get(user_id, {})), 'flow': flow}
+        db.execute('INSERT OR REPLACE INTO manual_users(user_id,payload) VALUES (?,?)',
+                   (user_id, json.dumps(payload, ensure_ascii=False)))
+
+
+def persist_manual(handler):
+    @functools.wraps(handler)
+    async def wrapped(update, context):
+        try:
+            return await handler(update, context)
+        finally:
+            if (update.effective_user and update.effective_user.id == ADMIN_ID
+                    and update.effective_chat and update.effective_chat.type == 'private'):
+                manual_save(ADMIN_ID, context.user_data)
+    return wrapped
+
+
+async def manual_startup(application):
+    with manual_state_db() as db:
+        rows = db.execute('SELECT user_id,payload FROM manual_users').fetchall()
+    for user_id, raw in rows:
+        payload = manual_unpack(json.loads(raw))
+        DRAFTS[user_id] = payload.get('draft', {})
+        DRAFTS[user_id]['job'] = None
+        DEFAULTS[user_id] = payload.get('defaults', {})
+        init_user_structs(user_id)
+        application.user_data[user_id].update(payload.get('flow', {}))
+        scheduled = DRAFTS[user_id].get('scheduled_at')
+        if isinstance(scheduled, datetime):
+            local = scheduled if scheduled.tzinfo else scheduled.replace(tzinfo=timezone(timedelta(hours=-5)))
+            delay = (local.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+            if delay > 0 and draft_has_content(DRAFTS[user_id]):
+                DRAFTS[user_id]['job'] = application.job_queue.run_once(
+                    send_scheduled_publication, delay, data={'user_id': user_id})
+            else:
+                # Keep expired drafts for review; never publish an old draft on restart.
+                DRAFTS[user_id]['scheduled_at'] = None
+                manual_save(user_id, application.user_data[user_id])
+                await application.bot.send_message(chat_id=user_id,
+                    text='Se recuperó tu borrador. Su horario ya pasó; revisa y programa de nuevo si deseas enviarlo.')
+    await education_startup(application)
 
 
 # --------- Utilidades de estado y estructuras ---------
@@ -206,7 +293,7 @@ def build_final_action_keyboard() -> List[List[InlineKeyboardButton]]:
             InlineKeyboardButton("⏰ Programar", callback_data="MENU_SCHEDULE"),
         ],
         [
-            InlineKeyboardButton("✏️ Editar publicación", callback_data="MENU_EDIT"),
+            InlineKeyboardButton("✏️ Editar texto del borrador", callback_data="EDIT_TEXT"),
         ],
         [
             InlineKeyboardButton("💾 Guardar como plantilla", callback_data="FINAL_SAVE_TEMPLATE"),
@@ -326,10 +413,14 @@ async def finish_album(context):
         m.caption for m in messages if m.caption
     )
     handler = handle_new_media if pending["state"] == "AWAITING_NEW_MEDIA" else handle_new_publication_message
-    await handler(first, context)
+    try:
+        await handler(first, context)
+    finally:
+        manual_save(user_id, context.user_data)
 
 
 # --------- Comandos ---------
+@persist_manual
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin_private(update):
         return
@@ -343,6 +434,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------- Callbacks de botones ---------
+@persist_manual
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -1051,10 +1143,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             await send_main_menu_simple(context, chat_id, user_id)
         else:
+            context.user_data["selected_template_text"] = None
             context.user_data["state"] = "AWAITING_EDIT_TEXT"
+            await send_publication_text(draft.get("text") or "(Sin texto)", chat_id, context, None)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="Envía ahora el nuevo texto de la publicación.",
+                text="Copia el texto anterior, cambia los números o lo que necesites y envíalo completo aquí. Solo cambia el texto del borrador; conserva imágenes y botones y no modifica la plantilla guardada.",
             )
 
     elif data == "EDIT_BUTTONS":
@@ -1184,6 +1278,7 @@ async def handle_new_publication_message(
         )
         return
 
+    draft.pop("text_source_message_id", None)
     draft["media"] = context.user_data.pop("received_album_media", [])
     album_caption = context.user_data.pop("received_album_caption", None)
     if album_caption is not None:
@@ -1352,7 +1447,7 @@ async def handle_schedule_datetime(
 async def handle_edit_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    message = update.message
+    message = update.effective_message
     if message is None or message.text is None:
         return
 
@@ -1361,7 +1456,10 @@ async def handle_edit_text(
     draft = get_draft(user_id)
 
     draft["text"] = message.text
+    draft["text_source_message_id"] = message.message_id
+    context.user_data["selected_template_text"] = None
     context.user_data["state"] = None
+    manual_save(user_id, context.user_data)
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1592,14 +1690,17 @@ async def send_scheduled_publication(context: ContextTypes.DEFAULT_TYPE) -> None
         )
     except Exception as exc:
         logging.error("Error enviando publicación programada: %s", exc)
+    finally:
+        manual_save(user_id)
 
 
 # --------- Router de mensajes ---------
+@persist_manual
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin_private(update):
         return
 
-    if update.message is None:
+    if update.effective_message is None:
         return
 
     user_id = update.effective_user.id  # type: ignore[union-attr]
@@ -1608,7 +1709,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     init_user_structs(user_id)
     state = context.user_data.get("state")
 
-    message = update.message
+    message = update.effective_message
+    if update.edited_message:
+        if message.text and (state == "AWAITING_EDIT_TEXT" or
+                get_draft(user_id).get("text_source_message_id") == message.message_id):
+            await handle_edit_text(update, context)
+        return
     if message.media_group_id and (message.photo or message.video):
         pending = PENDING_ALBUMS.get(user_id)
         if pending is not None and pending["group_id"] != message.media_group_id:
@@ -2572,7 +2678,7 @@ def main() -> None:
 
     TARGET_CHAT_ID = target_chat
 
-    application = ApplicationBuilder().token(token).post_init(education_startup).build()
+    application = ApplicationBuilder().token(token).post_init(manual_startup).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("educacion_estado", education_status))
@@ -2589,3 +2695,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
